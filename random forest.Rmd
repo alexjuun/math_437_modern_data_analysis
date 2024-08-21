@@ -1,0 +1,319 @@
+---
+title: "Alz random forest"
+author: "Alex"
+date: "2024"
+output: html_document
+---
+
+
+```{r setup,include=FALSE,results=FALSE,warning=FALSE,message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = 'hold')
+#Load Libraries and functions Dr. Abdoli made
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(tidyselect)
+library(kableExtra)
+library(NACCdata)
+library(glmnet)
+library(car)
+library(tibble)
+library(ggmosaic)
+library(ROCit)
+library(pROC)
+library(caret)
+library(randomForest)
+library(dplyr)
+library(rpart.plot)
+library(plyr)
+
+
+colTrim <- function(x, width){
+  x <- trimws(x)
+  sapply(x, strtrim, width=width)
+}
+source('describeDS.R')
+source('briefSummary.R')
+source('xval.R')
+```
+
+### Get Data:  
+These are the variables that will be used in the model. The order of variables are chosen for convenience of comparing coefficients; the order should not significantly affect the overall results.
+
+```{r}
+col2clean <- c('NACCID', 'NACCALZD', 'NACCAGE', 'BPDIAS', 'BPSYS',
+               'HXHYPER','HYPERCHO', 'HXSTROKE','CVHATT', 'CVCHF',
+               'CVAFIB','NACCBMI', 'DIABETES', 'B12DEF', 'DEP2YRS', 
+               'SMOKYRS', 'TOBAC100', 'PACKSPER', 'ALCOHOL', 
+               'NACCNIHR', 'HISPANIC','EDUC', 'SEX', 'MARISTAT',
+               'NACCVNUM', 'NACCNIHR_updated')
+cat(sprintf('{%s}', paste(col2clean, collapse = ', ')), sep='\n')
+```
+
+### Variable Specification
+The variable cleaning specifications are shown below:
+
+```{r}
+#reading the cleaning instructions
+glmDS0 <- read.csv('cleanUDS_EDA.csv')
+
+#making table
+glmDS0 %>% dplyr::select(-c(Rename, Comment, MissingValComment)) %>% 
+  dplyr::filter(GLM!="", Name %in% col2clean) %>% 
+  mutate(CurrentVal=colTrim(CurrentVal, 20)) %>% 
+  mutate(NewLevel=colTrim(NewLevel, 20)) %>% 
+  kbl(caption = 'UDS Variables for the Study') %>% 
+  kable_styling(full_width = FALSE,
+                bootstrap_options = c("striped", "hover", "condensed",
+                                      "responsive")) %>% 
+  column_spec(2, width_max = '2in') %>% 
+  column_spec(3, width_max = '2in') %>% 
+  scroll_box(height = "400px")
+```
+
+# Create the data frame
+```{r}
+#make data frame
+X <- NACCdata::cleanDS(
+  cleanDF = glmDS0 %>% filter(GLM!="", Name %in% col2clean)
+    ) 
+
+#checking race statements
+#how many people are multiracial and Hispanic
+nrow(X %>% 
+  filter(NACCNIHR == "Multiracial" & HISPANIC == "Hispanic"))
+#how many people are any race and hispanic? 
+nrow(X %>% 
+  filter(NACCNIHR != "" & HISPANIC == "Hispanic"))
+#how many people have a NA race value and are non hispanic
+nrow(X %>% 
+  filter(is.na(NACCNIHR) & HISPANIC == "non-Hispanic"))
+#how many people  have a NA race value and are hispanic
+nrow(X %>% 
+  filter(is.na(NACCNIHR) & HISPANIC == "Hispanic"))
+
+#make updated race variable
+X <- X %>% 
+  mutate(NACCNIHR_updated = case_when(
+    NACCNIHR != "" & HISPANIC == "Hispanic" ~ "Multiracial",
+    is.na(NACCNIHR) & HISPANIC == "non-Hispanic" ~ "Other",
+    is.na(NACCNIHR) & HISPANIC == "Hispanic" ~ "Hispanic",
+    TRUE ~ NACCNIHR
+  ))
+
+#checking to see if correct
+table(X$NACCNIHR_updated)
+
+
+#set reference category
+X$NACCNIHR_updated <- relevel(factor(X$NACCNIHR_updated), ref = "White")
+
+#how many records
+X <- X %>% filter(NACCVNUM==1)
+cat(sprintf('%d records is read.\n', dim(X)[1]))
+```
+
+## Incomplete Cases {.tabset}
+The incomplete cases are dropped and the counts of NA's before and after are reported. Then, variables are summarized in a brief format more appropriate for publications. 
+
+### Counting NAs
+```{r}
+cat('Before removing incomplete observations:\n\n')
+(naCounts <- sapply(colnames(X), \(v) sum(is.na(X[[v]]))))
+
+X <- X %>% 
+  drop_na(ALCOHOL) %>% 
+  drop_na(EDUC) %>% 
+  drop_na(MARISTAT) %>% 
+  drop_na(NACCBMI) %>% 
+  drop_na(PACKSPER) %>% 
+  drop_na(B12DEF) %>% 
+  drop_na(BPDIAS) %>% 
+  drop_na(BPSYS) %>% 
+  drop_na(CVAFIB) %>% 
+  drop_na(CVCHF) %>% 
+  drop_na(CVHATT) %>% 
+  drop_na(DEP2YRS) %>% 
+  drop_na(DIABETES) %>% 
+  drop_na(HXHYPER) %>% 
+  drop_na(HXSTROKE) %>% 
+  drop_na(HYPERCHO) %>% 
+  drop_na(NACCNIHR_updated)
+
+cat('\n\n\nAfter removing incomplete observations:\n\n')
+sapply(colnames(X), \(v) sum(is.na(X[[v]])))
+
+#mtry= 15
+#minn= 100
+#tree 1000
+```
+
+## Only AD and Normal Cognition
+```{r}
+uds <- X %>% mutate(NACCALZD=factor(NACCALZD, c("Normal", "Alzheimer"))) %>%
+  filter(!is.na(NACCALZD))
+
+nrow(uds)
+```
+
+```{r Biomarker data cleaning and join the table with uds and biomarker data}
+library(dplyr)
+library(plyr)
+
+bio <- NACCdata::biomarker_data %>%
+  dplyr::select(c(NACCID, CSFABETA, CSFTTAU))
+
+u_b <- left_join(uds, bio, by = "NACCID") %>%
+  drop_na(CSFTTAU) %>% 
+  drop_na(CSFABETA)
+```
+
+```{r}
+library(tidymodels)
+set.seed(1880)
+
+uds_split <- initial_split(u_b, prop = 0.80) 
+
+uds_train <- training(uds_split)
+uds_test <- testing(uds_split)
+```
+
+
+```{r}
+treeC_model <- decision_tree(mode = "classification", engine = "rpart", cost_complexity = tune())
+```
+
+
+```{r tree-tidy recipe}
+treeC_recipe <- recipe(
+  NACCALZD ~ NACCAGE + BPDIAS + BPSYS +HXSTROKE + CVAFIB +NACCBMI + B12DEF + DEP2YRS + PACKSPER + ALCOHOL + EDUC + MARISTAT + NACCNIHR_updated + CSFTTAU + CSFABETA,
+  data = uds_train
+)
+
+treeC_wflow <- workflow() |>
+  add_model(treeC_model) |>
+  add_recipe(treeC_recipe)
+```
+
+
+```{r}
+set.seed(1332)
+uds_kfold <- vfold_cv(uds_train, v = 5, repeats = 3) 
+
+treeC_tune1 <- tune_grid(treeC_model, 
+                      treeC_recipe, 
+                      resamples = uds_kfold, 
+                      metrics = metric_set(mn_log_loss),
+                      grid = grid_regular(cost_complexity(range = c(-4, 6)), levels = 20))
+
+autoplot(treeC_tune1)
+```
+
+
+```{r select best treeC}
+treeC_best <- select_by_one_std_err(
+  treeC_tune1,
+  metric = "mn_log_loss",
+  desc(cost_complexity)
+)
+treeC_best
+```
+
+
+```{r fit best model}
+treeC_wflow_final <- finalize_workflow(treeC_wflow, parameters = treeC_best) 
+
+treeC_fit <- fit(treeC_wflow_final, data = uds_train)
+treeC_fit
+```
+
+
+```{r}
+extract_fit_engine(treeC_fit) |>
+  plot() 
+```
+
+
+```{r augment treeC fit}
+broom::augment(treeC_fit, new_data = uds_test) |>
+  conf_mat(truth = NACCALZD, estimate = .pred_class)
+```
+
+
+```{r rfC-tidy model}
+rfC_model <- rand_forest(mode = "classification", engine = "ranger") |>
+  set_args(seed = 395,
+           importance = "permutation",
+           mtry = tune()
+  )
+
+rfC_recipe <- recipe(
+  NACCALZD ~ NACCAGE + BPDIAS + BPSYS +HXSTROKE + CVAFIB + NACCBMI + B12DEF + DEP2YRS + PACKSPER + ALCOHOL + EDUC + MARISTAT + NACCNIHR_updated + CSFTTAU + CSFABETA,
+  data = uds_train
+)
+
+rfC_wflow <- workflow() |>
+  add_model(rfC_model) |>
+  add_recipe(rfC_recipe)
+```
+
+Now we tune the model:
+
+```{r tune model kfold rfC}
+n_predictorsC <- sum(rfC_recipe$var_info$role == "predictor")
+manual_gridC <- expand.grid(mtry = seq(1, n_predictorsC))
+
+rfC_tune1 <- tune_grid(rfC_model, 
+                      rfC_recipe, 
+                      resamples = uds_kfold, 
+                      metrics = metric_set(mn_log_loss, accuracy),
+                      grid = manual_gridC)
+
+autoplot(rfC_tune1)
+```
+
+
+
+```{r select best rfC}
+rfC_best <- select_best(
+  rfC_tune1,
+  metric = "mn_log_loss"
+)
+```
+
+
+
+```{r fit rfC model}
+rfC_wflow_final <- finalize_workflow(rfC_wflow, parameters = rfC_best) 
+rfC_fit <- fit(rfC_wflow_final, data = uds_train)
+rfC_fit
+```
+```{r}
+broom::augment(rfC_fit, new_data = uds_test) |>
+  conf_mat(truth = NACCALZD, estimate = .pred_class)
+```
+```{r}
+brier_class(NA)
+```
+
+
+```{r rfC OOB Brier Score and vip}
+library(vip)
+rfC_engine <- rfC_fit |> extract_fit_engine()
+
+rfC_engine |> pluck("prediction.error")
+
+vip(rfC_engine, scale = TRUE)
+
+```
+
+
+```{r}
+NACCAGE + BPDIAS + BPSYS +HXSTROKE + CVAFIB +NACCBMI + B12DEF + DEP2YRS + PACKSPER + ALCOHOL + EDUC + MARISTAT + NACCNIHR_updated 
+
+#From Biomarker
+CSFTTAU+ CSFTPAU + CSFABETA
+```
+
+
+

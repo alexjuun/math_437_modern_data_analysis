@@ -1,0 +1,370 @@
+---
+title: "Alternatives to Accuracy Example Code and Class Activities"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background Information
+
+1. Briefly explain what is meant by each of the following terms: true positive, true negative, false positive, false negative.
+
+2. Briefly explain the difference between sensitivity and specificity of a model.
+
+```{r import data and packages, message = F, warning = F}
+library(tidyverse)
+library(kknn) # k-nn
+library(e1071) # Naive Bayes
+Restrain <- readr::read_csv("Restrain.csv")
+fv <- Restrain |>
+  filter(SubCategory %in% c("Fruits", "Vegetables"))
+fv$SubCategory <- factor(fv$SubCategory, levels = c("Fruits","Vegetables"))
+```
+
+Let's try to predict whether a food is a fruit or a vegetable. We'll use k-nearest neighbors (with k = 5) and naive Bayes. All of the accuracy measures we're going to be looking at will run as long as you have a data frame with the predicted and actual classes, but it's easiest to run everything with tidymodels so we have comparable structures:
+
+```{r validation split, message = F, warning = F}
+library(tidymodels) # load everything we need
+set.seed(1880)
+fv_split <- initial_split(fv, prop = 0.80) 
+
+fv_train_tidy <- training(fv_split)
+fv_valid_tidy <- testing(fv_split)
+
+library(forcats) # tidyverse for factors
+Restrain2 <- Restrain |> 
+  filter(!(SubCategory %in% c("Fruits", "Vegetables"))) |>
+  mutate(SubCategory =
+  fct_collapse(SubCategory,
+    savory = c("Bakery (savoury)", "Savoury snacks"),
+    sweet = c("Bakery (sweet)", "Biscuits", "Confectionery", "Desserts"),
+    takeout = c("Takeaway (chain)", "Takeaway (generic)")
+    )
+)
+
+set.seed(1880)
+Restrain_split <- initial_split(Restrain2, prop = 0.80)
+Restrain_train <- training(Restrain_split)
+Restrain_valid <- testing(Restrain_split)
+
+```
+
+5-nearest neighbors model:
+
+```{r 5-nn}
+K <- 5
+knn_model <- nearest_neighbor(mode = "classification", neighbors = K, dist_power = 2)
+# dist_power = 2 uses Euclidean distance
+
+knn_wflow <- workflow() |>
+  add_model(knn_model)
+
+
+knn_recipe <- recipe(
+  SubCategory ~ Taste + Cravings + Healthiness, # response ~ predictors
+  data = fv_train_tidy
+) |>
+  step_normalize(all_numeric_predictors()) # center and scale numeric predictors
+
+knn_wflow <- knn_wflow |>
+  add_recipe(knn_recipe)
+
+knn_fit <- fit(knn_wflow, data = fv_train_tidy)
+
+predictions_knn_df <- broom::augment(knn_fit, new_data = fv_valid_tidy)
+```
+
+
+Naive Bayes model:
+
+```{r nb-tidy, message = FALSE, warning = FALSE}
+library(discrim)
+library(klaR) # default package to fit naive Bayes with tidymodels
+
+nb_model <- naive_Bayes(mode = "classification", engine = "klaR")
+
+nb_wflow <- workflow() |>
+  add_model(nb_model)
+
+nb_recipe <- recipe(
+  SubCategory ~ Taste + Cravings + Healthiness, # response ~ predictors
+  data = fv_train_tidy
+)
+
+nb_wflow <- nb_wflow |>
+  add_recipe(nb_recipe)
+
+nb_fit <- fit(nb_wflow, data = fv_train_tidy)
+
+predictions_nb_df <- broom::augment(nb_fit, new_data = fv_valid_tidy)
+```
+
+
+Both of these models have 81% accuracy:
+
+```{r check accuracy}
+accuracy(predictions_knn_df, truth = SubCategory, estimate = .pred_class)
+accuracy(predictions_nb_df, truth = SubCategory, estimate = .pred_class)
+```
+
+But they do differ on a couple of predictions:
+
+```{r differing predictions}
+all_preds <- predictions_knn_df |> 
+  left_join(predictions_nb_df,
+            by = c("Food", "Category", "SubCategory", "Taste", "Cravings", "Healthiness"),
+            suffix = c("_knn", "_nb")) 
+all_preds |>
+  filter(.pred_class_knn != .pred_class_nb)
+```
+#NOTE: If your algorithm outputs probabilities: use them when evaluating accuracy. If it doesn't: ask why it doesn't!
+
+## Confusion Matrices
+
+Confusion matrices are generated using the `conf_mat` function in the `yardstick` package:
+
+```{r confmat for both}
+library(yardstick)
+confusion_knn <- conf_mat(predictions_knn_df, truth = SubCategory, estimate = .pred_class)
+confusion_nb <- conf_mat(predictions_nb_df, truth = SubCategory, estimate = .pred_class)
+confusion_knn
+confusion_nb
+```
+
+1. By default, the first level (Fruit) is considered "positive" and the second level (Vegetable) is considered "negative". Using this convention, identify the number of true positives, false positives, true negatives, and false negatives in the test set for the 5-nearest neighbors model.
+
+2. Assuming Fruit is positive and Vegetable is negative, estimate the sensitivity and specificity of the 5-nearest neighbors model.
+
+When the model outputs probabilities, we can choose a different threshold. Here we'll set the threshold for predicting an object to be a fruit to be 20%:
+
+```{r predfruit-2}
+predictions_knn_df2 <- predictions_knn_df |>
+  mutate(
+  .pred_class2 = if_else(.pred_Fruits >= 0.20, "Fruits", "Vegetables") |> as.factor()
+  # truth and estimate must be factor variables
+)
+
+confusion_knn2 <- conf_mat(predictions_knn_df2, 
+                           truth = SubCategory, 
+                           estimate = .pred_class2)
+
+confusion_knn2
+```
+
+For response variables with multiple classes, this threshold-adjusting trick doesn't work: we have to assign to the "most likely" class.
+
+```{r multiple class model}
+# Same predictors, same response, different data!
+nb_multi_fit <- fit(nb_wflow, data = Restrain_train)
+
+nb_multi_df <- broom::augment(nb_multi_fit, new_data = Restrain_valid)
+
+confusion_nb2 <- conf_mat(nb_multi_df, 
+                           truth = SubCategory, 
+                           estimate = .pred_class)
+confusion_nb2
+```
+
+If we want to "adjust our thresholds", we should use a generative model and adjust the prior probabilities; however, this is not so easy to do with tidymodels.
+
+### ROC Curves
+
+For a binary response variable, because we can choose any arbitrary threshold we want, we can look at the sensitivity and specificity (or equivalently, sensitivity and false positive rate) over the entire range of thresholds. This plot is called a Receiver Operating Characteristic (ROC) curve:
+
+```{r ROC curve - knn}
+# Construct the ROC curve
+roc_tibble_knn <- roc_curve(predictions_knn_df, truth = SubCategory, .pred_Fruits)
+roc_tibble_nb <- roc_curve(predictions_nb_df, truth = SubCategory, .pred_Fruits)
+
+# Plot the ROC curve
+autoplot(roc_tibble_knn) + labs(title = "ROC Curve for k-nn")
+autoplot(roc_tibble_nb) + labs(title = "ROC Curve for Naive Bayes")
+```
+
+3. How do we read these graphs?
+
+How do we compare two ROC curves? We look at the Area Under the Curve (AUC), which integrates the ROC curve across the entire possible range of threshold probabilities:
+
+```{r AUC}
+roc_auc(predictions_knn_df, truth = SubCategory, .pred_Fruits)
+roc_auc(predictions_nb_df, truth = SubCategory, .pred_Fruits)
+```
+
+An AUC of 0.5 indicates that we are doing no better than coin-flip at predicting classes. The higher the AUC, the better the model.
+
+How do we pick the optimal threshold? There are three options:
+
+* Use a significance-level type threshold for the false positive rate:
+
+```{r FPR threshold}
+alpha <- 0.05 # 5% false positive rate
+roc_tibble_knn |> 
+  filter(
+  specificity > 1 - alpha # = at least 95% specificity
+  ) |>
+  filter(sensitivity == max(sensitivity))
+```
+
+This code finds the maximum sensitivity given a false positive rate less than $\alpha$. Here that's not very useful because we only have 21 points in the holdout set, but if you had a larger holdout set you might find it useful.
+
+* Find the threshold that matches the point closest to the upper left of the ROC plot (by Euclidean distance).
+
+```{r Euclidean distance}
+roc_tibble_knn |> 
+  mutate(
+  dist = sqrt((1-sensitivity)^2 + (1-specificity)^2)
+) |>
+  filter(
+  dist == min(dist) # minimum distance from top-left
+)
+```
+
+* Find the threshold that maximizes Youden's J-index (sensitivity + specificity - 1)
+
+```{r }
+roc_tibble_knn |>
+  mutate(j_index = sensitivity + specificity - 1) |>
+  filter(j_index == max(j_index)) # maximizing this minimizes (2 - sens - spec) = Manhattan distance to top left
+```
+
+Notice that depending on what metric we choose, we find different optimal thresholds.
+
+## Summarizing the Confusion Matrix
+
+```{r summary conf_mat}
+summary(confusion_knn)
+```
+
+This produces a ton of accuracy measures, including accuracy, sens (sensitivity), spec (specificity), and j_index (Youden's j-index), which we've already seen. You can get any of these measures by calling the function name in the `.metric` column.
+
+1. What do `ppv` and `npv` measure? Explain how to find them based on the number of true positives, false positives, true negatives, and false negatives.
+
+2. What does `f_meas` (F1 score) measure?
+
+3. What does `kap` (Cohen's kappa) measure?
+
+4. What does `mcc` (Matthews correlation coefficient) measure?
+
+Note that we are assuming that positive is "Fruits" and negative is "Vegetables". To flip this, we have to tell R to use the other level:
+
+```{r summary conf_mat flipped}
+confusion_knn |>
+  summary(event_level = "second")
+```
+
+## Variations on MSE for Categorical Variables
+
+Recall that we cannot use MSE to evaluate a classification model. However, there are a couple of variations on MSE that work very well. In particular, these variations on MSE work on the predicted probabilities instead of the predicted classes, which allows us to distinguish between two models that give similar predictions based on which model is more confidently correct in its predictions.
+
+### Brier Score
+
+Recall that for a regression model,
+
+$$
+MSE = \frac{1}{n} \sum_{i=1}^n (y_i - \hat{y}_i)^2
+$$
+
+Brier score directly generalizes the formula for MSE for use with categorical variables. The idea is that when we know the true class for an observation, it has probability 1 of being in that class and probability 0 of being in any other class. Thus, in the formula for MSE, $y_i = 1$ and $\hat{y}_i = p_i$, the estimated probability of observation $i$ being in its actual class. Plugging into the formula for MSE gives:
+
+$$
+\text{Brier score} = \frac{1}{n} \sum_{i=1}^n (1 - p_i)^2
+$$
+
+Unfortunately, there is no direct function to get the Brier score out of the  `yardstick` package, but it's relatively simple to compute on your own using the augmented test set and an `if_else` or `case_when` statement:
+
+```{r Brier score}
+brier_knn <- predictions_knn_df |>
+  mutate(
+  squared_error = if_else(
+    SubCategory == "Fruits",
+    (1 - .pred_Fruits)^2, # if true
+    (1 - .pred_Vegetables)^2 # if false
+  )
+)
+mean(brier_knn$squared_error)
+
+brier_nb <- predictions_nb_df |>
+  mutate(
+  squared_error = case_when(
+    SubCategory == "Fruits" ~ (1 - .pred_Fruits)^2,
+    SubCategory == "Vegetables" ~ (1 - .pred_Vegetables)^2
+  )
+)
+mean(brier_nb$squared_error)
+```
+
+Like MSE, lower Brier score indicates a more accurate model. A Brier score of 0.25 indicates that the model is no better than a coin flip, while a Brier score of 0 indicates that the model is not only 100% accurate but also is supremely confident in each prediction. 
+
+### Cross-Entropy/Log-Loss
+
+Instead of directly replacing $y_i$ and $\hat{y}_i$ in the formula for MSE, we can take a more conceptual approach. RSS (and hence MSE) falls directly out of the likelihood function for linear regression, so minimizing RSS/MSE is equivalent to maximizing the likelihood function. We can incorporate a similar idea for classification problems: find a function of the probabilities for which minimizing that function is equivalent to maximizing the likelihood function.
+
+we can write the likelihood function as:
+
+$$
+L(p_1, p_2, \ldots, p_K | X, Y) = \prod_{i=1}^n\prod_{l=1}^K p_{il}^{y_{il}}
+$$
+
+where $p_{i1} + p_{i2} + \ldots + p_{iK} = 1$ for all $i$,  $y_{il} = 1$ if $y_i = k$ and 0 otherwise.
+
+This expression is unwieldy and we prefer to maximize it by maximizing the log-likelihood:
+
+$$
+l(p_1, p_2, \ldots, p_K | X, Y) = \sum_{i=1}^n\sum_{l=1}^K y_{il} log(p_{il})
+$$
+
+But notice that $\sum_{l=1}^K y_{il} log(p_{il}) = log(p_{i})$, where again $p_i$ is the estimated probability of observation $i$ being in its actual class.
+
+Therefore, maximizing the log-likelihood is equivalent to minimizing its negative,
+
+$$
+\text{log loss} = - \sum_{i=1}^n log(p_{i})
+$$
+
+$$
+\text{mean log loss} = \frac{- 1}{n} \sum_{i=1}^n log(p_{i})
+$$
+
+Typically we work with the mean log loss, which just divides this expression by n (essentially the classification equivalent of RSS vs. MSE).
+
+For binary classification, give one column containing the predictions and whether it matches the first or second level of the response variable. The default is to use the mean but the argument `sum = TRUE` will give the sum instead.
+
+```{r log-loss}
+mn_log_loss(predictions_knn_df,
+            truth = SubCategory,
+            .pred_Fruits,
+            event_level = "first"
+)
+
+mn_log_loss(predictions_knn_df,
+            truth = SubCategory,
+            .pred_Vegetables,
+            event_level = "second"
+)
+```
+
+If your response variable has more than two classes, you'll need to list out all the columns with predictions:
+
+```{r log-loss multiple}
+mn_log_loss(nb_multi_df,
+            truth = SubCategory,
+            # Three or more columns!
+            .pred_savory,
+            .pred_sweet,
+            .pred_takeout
+            )
+```
+
+But this throws an error if you only have two classes:
+ 
+```{r log-loss error, eval = FALSE}
+mn_log_loss(predictions_knn_df,
+            truth = SubCategory,
+            .pred_Fruits,
+            .pred_Vegetables
+)
+```
+
+Like MSE, lower log loss indicates a more accurate model. Whereas Brier score was restricted to $[0, 1]$, log loss is on the interval $[0, \infty)$ where a log loss of 0 also indicates that the model is not only 100% accurate but also is supremely confident in each prediction. 

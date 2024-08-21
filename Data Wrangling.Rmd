@@ -1,0 +1,381 @@
+---
+title: "Data Wrangling with dplyr: Worked Example"
+author: "Math 437"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk by typing `Ctrl/Cmd + Alt + I`, and the code chunk will look like this:
+
+```{r cars}
+# Type your code here
+summary(cars)
+```
+
+To run a chunk of code, click the green arrow ("Play Button") at the top right of the chunk.
+
+I promise that I will stop including this preamble once we get familiar with writing and running an R Markdown file. 
+
+## Data Wrangling Goals
+
+The general ethos of data wrangling is to get your data in a form suitable for modeling. Data wrangling is often performed alongside exploratory data analysis, going back and forth between the two as necessary.
+
+We'll illustrate some of the thought process and associated code using baseball player salaries from ~40 years ago in the `Hitters` dataset from the `ISLR2` package.
+
+## Step 1: Make Sure You Can Get the Data Into R
+
+Since the `Hitters` dataset is already part of a package, we just have to load the package to have the data available to us. This is rarely the case; we almost always have to import the data from an external file.
+
+Some "conventional" file types (.csv, .xls/.xlsx, and database files from SPSS/SAS/Stata) can be imported using the "Import Dataset" button in R Studio, but if you're not in R Studio, or you're in an R Markdown document, you'll need to write code to import it. It's usually easiest to just copy the code out of the "Code Preview" section of the R Studio dialog. Note that R Studio can sometimes crash trying to preview a very large dataset, so you may have to write code even if the file extension is one supported by the R Studio GUI. For large delimited text files (e.g., .csv or tab-delimited .txt files), `fread` from the `data.table` package usually works best.
+
+For other data formats, you'll usually have to look online to figure out the best package to use to import the file. Worst-case scenario, any file that can be opened in a text editor can probably be read using `scan`, `read.table`, or `readLines`.
+
+```{r load packages}
+library(ISLR2) # already contains Hitters dataset
+library(dplyr)
+library(ggplot2)
+library(stringr)
+```
+
+I like to do a few checks to make sure everything imported okay. `View()` is the recommended function for viewing the full dataset in a separate window in R Studio (or you can click the dataset name in your *Environment* pane in R Studio to do the same thing), but you may also want to use some of:
+
+```{r check data}
+head(Hitters) # first 6 rows
+dim(Hitters) # number of rows and columns
+colnames(Hitters) # variable names
+glimpse(Hitters) # variable names, types, and first few values
+```
+
+Note that `glimpse` is part of the `dplyr` package, and you can get most of the benefits of `glimpse` by finding the dataset in your *Environment* pane in R Studio and clicking the arrow to expand the dataset.
+
+Generally, the *very first* thing we should do after verifying that our data imported okay is to split the data and reserve a holdout set for model validation and testing. The only times we *shouldn't* do this is when we need to do some data wrangling to get the data to import correctly, or when we have pre-specified *exactly* the inferential model that we want to make and are not concerned about prediction.
+
+Be careful when doing the splitting to ensure that information does not "leak" into the holdout set. For example, with time-stamped data, everything in the training set should have been observed earlier than anything in the holdout set. For another example, if two observational units are clearly related (e.g., two divisions of the same company), the rows corresponding to both observational units should go in one or the other set. 
+
+Since there is no obvious dependence in this data, we can use just a random 80%/20% split - 80% in the training set that we will look at, 20% in the holdout set.
+
+```{r load and split data}
+set.seed(195)
+n <- nrow(Hitters)
+train_indices <- sample(n, size = floor(0.8*n))
+Hitters_train <- Hitters[train_indices,]
+Hitters_holdout <- Hitters[-train_indices,]
+```
+
+## The "Big Five" Verbs for Data Wrangling
+
+Before we start coding any data wrangling, we should write *pseudocode* indicating what we want our code to achieve. By writing our pseudocode algorithmically, we can break down complex code into multiple simple instructions.
+
+The `dplyr` package makes it easy to turn data wrangling pseudocode into real code via the use of a "pipe" operator (historically, `%>%`; since R 4.0, R has included a native `|>` operator). The pipe operator is typically written at the end of a line of code and read, "then...". In other words, when we convert our pseudocode to real R code, every time we see something like "and then," we will express it in code using `|>`.
+
+The five verbs that will be most commonly used in data wrangling are:
+
+1. **Subset** rows and/or columns of a dataset
+2. **Create** new variables in the dataset
+3. **Sort** a dataset by values of one or more variables
+4. **Group** rows together that contain the same value of one or more variables
+5. **Merge** a dataset with a second dataset based on one or more common variables
+
+## Subsetting Data
+
+The `dplyr` package includes two different functions for subsetting data: `filter` for subsetting rows and `select` for subsetting columns.
+
+Let's look at our first example code, where we're going to subset the `Hitters_train` dataset to include only the variables of interest in the rest of the activity:
+
+```{r example select}
+Hitters2 <- Hitters_train |> 
+  select(Salary, AtBat, Hits, HmRun, League, Division, NewLeague)
+```
+
+Notice the syntax here. We put the pipe (`|>`) at the end of the line, then start a new line with our function verb. In pseudocode, this reads, "Start with our Hitters_train dataset, then subset to include only the variables `Salary`, `AtBat`, `Hits`, `HmRun`, `League`, `Division`, and `NewLeague`."
+
+The example code in the next chunk subsets the rows of the dataset to include only the players with at least 200 At-Bats:
+
+```{r example filter}
+Hitters3 <- Hitters2 |> 
+  filter(AtBat >= 200)
+```
+
+### To Overwrite or Not?
+
+Notice that I'm creating a new dataset object here (`Hitters3`) rather than overwriting the old one (`Hitters2`). There are advantages and disadvantages to this approach. The main advantage to this approach is that the output of each intermediate step is stored in your environment, so it's a little bit easier to debug. The disadvantages are that you have to remember what you named the output of every intermediate step and that it is incredibly memory-inefficient.
+
+### Chaining Together Work
+
+We don't have to create a new dataset on every single step. In fact, I rarely do - I write all of my pseudocode at once and then *chain* these steps together using the pipe.
+
+For example, here I start with my `Hitters_train` dataset, then select the variables I want to work with, then subset the data to include only players with at least 200 at-bats. I do this in a single chunk of code without creating or overwriting new variables:
+
+```{r example both select and filter}
+Hitters3 <- Hitters_train |> 
+  select(Salary, AtBat, Hits, HmRun, League, Division, NewLeague) |>
+  filter(AtBat >= 200)
+```
+
+## Creating New Variables
+
+The function in `dplyr` to create new variables is `mutate`. I use this function all the time to:
+
+1. Change the type of an existing variable (for example, from numerical to categorical)
+2. Transform a numerical variable
+3. Rename categories, group categories, or otherwise restructure a categorical variable
+4. Parse text (string/character) variables
+5. Create new features that are combinations of multiple variables
+6. Add "original" row numbers before doing something that will reorder rows (so that I can get the original row order back later)
+7. Change the index of a variable (for example, find the value in the next row)
+8. Other uses that I can't think of off the top of my head
+
+The point is that `mutate` is fantastically versatile and solves a lot of data wrangling problems, either by itself or in combination with other functions.
+
+Let's look at a couple of examples. In the first example, we're going to create a couple of "rate stats" - statistics that in a sense "normalize" for the number of opportunities a player had:
+
+```{r create rate stats}
+Hitters3 <- Hitters3 |>
+  mutate(
+    BattingAvg = Hits/AtBat,
+    DollarsPerHR = (Salary*1000)/HmRun
+  )
+```
+
+I highly recommend putting each new variable that you create (or overwrite) in its own row; that makes it much easier for someone else (most likely future you) to figure out what new variables you added and what you named them.
+
+Our second example is a bit more complicated. If we look at the dataset, we find that the player name is *not* an actual variable in the dataset, but rather a separate column (known as the `rownames` for the dataset) that we cannot work with. 
+
+```{r create name column}
+Hitters3 <- Hitters3 |>
+  mutate(
+    Name = str_remove(rownames(Hitters3), "-")
+  )
+```
+
+When I initially prepped this example, I got annoyed that the `-` in front of all the players' names was copied over. So I updated the example code to get rid of it using the `str_remove` function from the `stringr` package.
+
+## Sorting a Dataset
+
+The main function in `dplyr` to sort a dataset is `arrange`. You can sort by multiple variables and in either ascending or descending order.
+
+```{r example arrange}
+Hitters3 |> 
+  arrange(desc(HmRun), Salary)
+```
+
+In this example, we will first sort in *descending* order by the number of home runs, then break ties in *ascending* order by the salary. For example, the data for Jesse Barfield is in the top row because he hit 40 home runs, more than anyone else in our training set. Jose Canseco and Rob Deer each hit 33 home runs, so we need to break the tie between them based on `Salary`; Jose Canseco's data appears first because he had a lower salary. If a tie cannot be broken based on the variables provided, the tie will be broken based on the row number in the *original* dataset being arranged.
+
+## Grouping a Dataset
+
+Especially when the variables we want to work with are categorical, it is often more useful to *group* the variables so that rows in the same category are grouped together. With `dplyr`, we use `group_by` to group, then do some data wrangling within each group, then (if necessary) `ungroup` to remove the grouping (but keep the new row order).
+
+### Grouped Summaries
+
+By far the most common use of `group_by` is to immediately follow with `summarize` to create grouped summaries.
+
+This code:
+
+```{r not-grouped summarize}
+Hitters3 |> 
+  summarize(
+    mean_HR = mean(HmRun),
+    sd_HR = sd(HmRun)
+  )
+```
+
+just computes the mean and standard deviation of `HmRun`. However, if we want to look at how that mean and standard deviation change between leagues, we can group by `League` and then summarize:
+
+```{r grouped summarize}
+Hitters3 |> 
+  group_by(League) |>
+  summarize(
+    mean_HR = mean(HmRun),
+    sd_HR = sd(HmRun)
+  )
+```
+
+One quirk of `dplyr` is that there are several different ways to get the number of rows in each group. If you're already using `summarize`, the easiest thing to do is to pass it as another summary:
+
+```{r count rows using n}
+Hitters3 |> 
+  group_by(League) |>
+  summarize(
+    n = n(),
+    mean_HR = mean(HmRun),
+    sd_HR = sd(HmRun)
+  )
+```
+
+We can group by multiple variables and summarize within each combination of categories:
+
+```{r group by League and Division}
+Hitters3 |>
+  group_by(League, Division) |>
+  summarize(
+    n_players = n(),
+    mean_HR = mean(HmRun),
+    sd_HR = sd(HmRun)
+)
+```
+
+We can also perform `mutate` functions *within* groups. For example, this computes the z-score (relative to their League and Division) for the number of home runs for each player:
+
+```{r grouped mutate}
+Hitters3 |> 
+  group_by(League, Division) |>
+  mutate(
+    HR_zscores = (HmRun - mean(HmRun))/sd(HmRun)
+    )
+```
+
+We can then sort to see who had the most home runs *relative* to "average" in their league and division. Since here we want to sort the *entire* dataset, not just within each group, we will have to `ungroup` the dataset before sorting:
+
+```{r with ungroup}
+Hitters3 |> 
+  group_by(League, Division) |>
+  mutate(
+    HR_zscores = (HmRun - mean(HmRun))/sd(HmRun)
+    ) |>
+  ungroup() |>
+  select(Name, League, Division, HmRun, HR_zscores) |>
+  arrange(desc(HR_zscores), Name)
+```
+
+When doing something like this, you almost certainly want to write your pseudocode first, so that you can figure out where the `ungroup` goes. Sometimes R can intuit where the `ungroup` goes without you coding it, but it's usually better to write it explicitly.
+
+## Merging Datasets
+
+Sometimes you need to get data from multiple sources, or the data you need comes in multiple files, but you want all of the data to be contained in a single dataset. This is where merging comes in.
+
+The most common merging functions in `dplyr` are referred to as "mutating joins" because they add new variables (`mutate`) to an existing dataset. Let's look at the 4 most common types of mutating joins. To do this, we'll need a second dataset:
+
+```{r load Hitters_advanced}
+Hitters_Advanced <- readr::read_csv("Data/Hitters_Advanced.csv")
+# Note: you may have to change the file path
+names(Hitters3)
+names(Hitters_Advanced)
+```
+
+We want to merge the two datasets based on the player's name. However, this variable is called `Name` in the `Hitters3` dataset and `PlayerName` in the `Hitters_Advanced` dataset. This is not a problem at all; we just have to be careful to let R know which variable in each dataset contains the information we want to merge based on.
+
+We'll start with a `left_join`. In this type of join, our base dataset is the dataset before the pipe, and we "add on" another dataset ("Start with Hitters3, then add Hitters_Advanced to it").
+
+```{r left join}
+Hitters_Left <- Hitters3 |>
+  left_join(Hitters_Advanced, by = c("Name" = "PlayerName"))
+dim(Hitters3)
+dim(Hitters_Advanced)
+dim(Hitters_Left)
+```
+
+Notice that we keep the original 230 rows from the `Hitters3` dataset, but now we have added 13 columns (all 13 variables except `PlayerName`) from the `Hitters_Advanced` dataset.
+
+```{r look at left_join}
+Hitters_Left |>
+  select(Name, League, Team, Doubles, HmRun) |>
+  arrange(HmRun, Name) |>
+  head(10)
+```
+
+Notice that Argenis Salazar is in the `Hitters3` dataset but *not* in the `Hitters_Advanced` dataset, so any variable from the `Hitters_Advanced` dataset is indicated as missing for him.
+
+A `right_join` works similarly to a `left_join`, except now the base dataset is inside the function and the dataset to be added is the one to the left of the pipe ("Start with Hitters3, then add it to Hitters_Advanced").
+
+```{r right join}
+Hitters_Right <- Hitters3 |>
+  right_join(Hitters_Advanced, by = c("Name" = "PlayerName"))
+dim(Hitters3)
+dim(Hitters_Advanced)
+dim(Hitters_Right)
+```
+
+Notice that we keep the original 771 rows from the `Hitters_Advanced` dataset, but now we have added 10 columns (all 10 variables except `Name`) from the `Hitters3` dataset.
+
+```{r look at right_join}
+Hitters_Right |>
+  select(Name, League, Team, Doubles, HmRun) |>
+  arrange(desc(Doubles), Name) |>
+  head(10)
+```
+
+Notice that Jim Rice is in the `Hitters_Advanced` dataset but *not* in the `Hitters3` dataset (he ended up in the holdout set), so any variable from the `Hitters3` dataset is indicated as missing for him.
+
+If we want to include *all* the hitters in either dataset, we can use a `full_join`. For this type of join, it doesn't really matter which dataset goes to the left of the pipe; pick the one whose columns you want on the left of the merged dataset.
+
+```{r full_join}
+Hitters_All <- Hitters3 |>
+  full_join(Hitters_Advanced, by = c("Name" = "PlayerName"))
+dim(Hitters3)
+dim(Hitters_Advanced)
+dim(Hitters_All)
+```
+
+If instead we want to include *only* the hitters in *both* datasets, we can use an `inner_join`:
+
+```{r inner_join}
+Hitters_Both <- Hitters3 |>
+  inner_join(Hitters_Advanced, by = c("Name" = "PlayerName"))
+dim(Hitters3)
+dim(Hitters_Advanced)
+dim(Hitters_Both)
+```
+
+Note that when joining by something like names, it is very easy to miss some matches because the same person will be referred to different ways in different datasets. For example:
+
+```{r watch out join on names}
+Hitters3 |>
+  select(Name) |>
+  arrange(Name) |>
+  slice(6:15)
+
+Hitters_Advanced |>
+  select(PlayerName) |>
+  arrange(PlayerName) |>
+  slice(21:30)
+```
+
+you will notice that there is a player named "Andy VanSlyke" in the `Hitters3` dataset and a player named "Andy Van Slyke" in the `Hitters_Advanced` dataset. This is the same player, but R will not recognize that. Multiple people with the same name, different conventions for recording non-English characters, including vs. not including a middle name, "Jr." vs "Jr", etc. can wreak havoc on your attempts to match by name. There is a reason people try to match based on (arbitrarily assigned, but consistent) IDs rather than names.
+
+## Conditional Statements
+
+Conditional statements are usually used inside mutate statements to control the values of the new variable. However, you can use them as replacements for the base R `ifelse()` and `switch()`. I almost always use `if_else()` from the `dplyr` package instead of `ifelse()`.
+
+If you look at the guts of `if_else`, the idea is that it creates three vectors: `out`, the vector to output; `true`, the vector computed assuming the condition is always true; and `false`, the vector computed assuming it's always false. Then it just replaces the values of `out` with the appropriate values of `true` or `false`.
+
+```{r example if_else}
+Hitters3 |> 
+  mutate(
+    Million = if_else(Salary >= 1000, "Yes", "No", 
+                      missing = "Unknown")
+  ) |> 
+  group_by(Million) |>
+  summarize(
+    n_players = n(), 
+    MedianSalary = median(Salary)
+  )
+```
+
+The missing argument is nice because it allows you to replace `NA` values with an actual value; however, in practice, I rarely use it unless I want to explicitly code the missingness.
+
+When you want to return values based on one of more than two conditions, you can use the `case_when` function to get around chaining the if-else statements together. The syntax is slightly more complicated:
+
+```{r case_when}
+Hitters3 |>
+  mutate(
+    HR_zscores = case_when(
+      League == "A" & Division == "E" ~ (HmRun - 13.6)/9.42,
+      League == "A" & Division == "W" ~ (HmRun - 12.8)/9.54,
+      League == "N" & Division == "E" ~ (HmRun - 9.63)/6.87,
+      League == "N" & Division == "W" ~ (HmRun - 9.89)/8.17,
+      TRUE ~ NA_real_
+      # have to specify it's a real NA because the rest are numbers 
+    )
+  ) |>
+  select(Name, League, Division, HmRun, HR_zscores) |>
+  arrange(desc(HR_zscores))
+```
+
+For `case_when`, you use a series of formula arguments. IF the statement on the left is true, THEN use the value on the right. Your last formula should always be `TRUE ~ something` (just in case you end up with weird data issues).

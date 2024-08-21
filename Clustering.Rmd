@@ -1,0 +1,363 @@
+---
+title: 'K-Means and Model-Based Clustering Example Code and Class Activities'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r new packages, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(tidymodels)
+library(tidyclust) # new package to learn
+```
+## NOTE:
+1. Goal: Find subgroups that share common characteristics
+-No response variable!
+-Groups are not pre-specified. Instead, we look to see what properties. Obs. in a group have in common (distinct from other groups). 
+-Very common application: market segmentation (cluster customers)
+
+Formalize the k-means clustering problem
+Let C_1, ...,C_k be K clusters such that every obs. belongs to exactly 1 cluster.
+Let |C_k| represent the cardianlity of cluster C_k. 
+We wish to minimize summation k=1 to k W(C_k) where 
+W(C_k) = 1/|C_k| summation i,j E C_k summation j=1 to P (x_ij - x_i'j)^2 
+
+This problem is solvable in O(n^KP)
+
+
+
+
+## Data
+
+Our goal in this example is going to be to try to identify foods that are similar to each other. Technically speaking, clustering algorithms are inherently exploratory, and you *do not* need to make training-test splits unless you are using clustering as part of EDA pursuant to creating a supervised learning model. However, tidymodels includes some nice functions that will predict which cluster a new observations will go in, so we will do the training-test split to illustrate how those functions work.
+
+```{r import Restrain data}
+Restrain <- readr::read_csv("Restrain.csv")
+
+fv <- Restrain |>
+  filter(SubCategory %in% c("Fruits", "Vegetables"))
+fv$SubCategory <- factor(fv$SubCategory, levels = c("Fruits","Vegetables"))
+set.seed(1880)
+fv_split <- initial_split(fv, prop = 0.80) 
+
+fv_train_tidy <- training(fv_split)
+fv_test_tidy <- testing(fv_split)
+```
+
+## Preprocessing the Data
+
+Clustering algorithms rely *heavily* on the idea of a distance between two points, or the distance between a point and a mean. Therefore, when preprocessing the data, it is *critical* to think about what the "distance" between two points means:
+
+* Nominal variables should always be converted to indicator variables, so that a one-unit "distance" represents the change from a category to a reference category. Depending on the algorithm, the choice of reference category can be very important for non-binary variables.
+* Ordinal variables should be converted to "ranks", although you will have to put some thought into how many "ranks" correspond to a one-unit "distance" (e.g., does one unit represent the distance from "Strongly Agree" to "Agree" or from "Strongly Agree" to "Neutral"?).
+* Numerical variables often need to be transformed so that "distance" measures correspond better to intuition. For example, I always log2-transform frequency (Hz) variables because the "intuitive" measure of distance is an octave (doubling in frequency). You may also consider transformations like Box-Cox or Yeo-Johnson if a variable is highly skewed or has extreme outliers.
+* Numerical variables should almost always be standardized to have mean 0 and standard deviation 1 (after transformation), so that a distance of 1 consistently corresponds to a difference in z-scores of 1 (on the transformed scale).
+* If you have a lot of variables, dimensionality reduction techniques such as PCA may be useful for both reducing the number of features in the model and reducing the correlation of those features.
+* The `step_zv()` step is useful for removing completely irrelevant variables - either numerical variables that contain the same value for every observation or dummy variables that correspond to a category no observations are actually in. 
+
+```{r preprocessing recipes}
+kmeans_recipe_fv <- recipe(~ Taste + Cravings + Healthiness, 
+                           data = fv_train_tidy) |>
+  step_BoxCox(all_numeric_predictors()) |> # deal with skew issues
+  step_normalize(all_numeric_predictors()) |> # deal with different variances
+  step_dummy(all_nominal_predictors()) |> # this won't do anything here but is necessary on the batting data
+  step_zv(all_predictors()) # this won't do anything here but is necessary on the batting data
+```
+
+Technically, k-means clustering can run *without* assuming normality or centering/scaling the predictors. However, if you run k-means clustering without doing any pre-processing, you need to make sure that a difference of "1 unit" means the same thing in *every* dimension of the predictor space.
+
+## k-Means Clustering
+
+```{r set up kmeans}
+kmeans_model <- k_means(num_clusters = tune()) |>
+  set_args(nstart = 20)
+```
+
+We will be using the `k_means` function in the `tidyclust` package. Like pretty much everything else in the tidymodels ecosystem, it includes an `engine` argument. Currently there are two accepted engines: `stats` (which runs the default `kmeans`) and `clusterR`. We will use the `stats` engine for two reasons: first, it matches the Chapter 12 lab, and second, its default settings tend to produce clusters that are both intuitive and less dependent on the initial cluster assignment.
+
+### Parameters to Tune
+
+* `num_clusters`: the number of clusters. The "best" 3-cluster partition may have absolutely nothing in common with the "best" 4-cluster partition.
+
+### Injecting Randomness and `nstart`
+
+It is *highly* recommended to run k-means clustering a whole bunch of times using different randomly-selected initial cluster assignments. The reason for this is that the solution at convergence is not guaranteed to be a global optimum, so by starting from a bunch of different places we increase the likelihood that *one* of those solutions is globally optimal. 
+
+The argument `nstart` indicates how many times to run the model using a different starting point. The textbook suggests that 20 and 50 are conventional "large enough" numbers. However, R uses a default of 1. Therefore, we are almost certainly going to pass the argument `nstart` to the `set_args` function.
+
+### Choosing Initial Clusters
+
+There are a variety of ways to choose the initial cluster centers.
+
+* The default in most algorithms is to pick the initial cluster centers uniformly at random from the observations in the dataset.
+* The default in `kmeans`, and the algorithm suggested by the textbook, is to randomly assign each point in the dataset to an initial cluster, then compute the centers of each cluster. This is generally inefficient as the initial centers tend to be close to each other.
+* The default in MATLAB is to pick the first initial center uniformly at random from the observations in the dataset, then choose subsequent centers randomly from the non-chosen points with probability proportional to the squared Euclidean distance between the point and its nearest already-chosen center ("k-means++" algorithm). This tends to improve convergence because the initial centers tend to be more spread out.
+* There are various deterministic methods, but these are generally not recommended as there is no guarantee we start in a "good" partition and we cannot "randomize" our way out.
+
+### Updating the Clusters
+
+There are three general algorithms used to do k-means clustering: Lloyd's algorithm (detailed in the book), MacQueen's algorithm, and Hartigan's algorithm (the default option in `kmeans`, `Hartigan-Wong`).
+
+* Lloyd's algorithm batch-assigns points to clusters on each iteration: all observations are assigned to the cluster with the "closest" center at the same time. This typically requires more iterations.
+* MacQueen's algorithm and Hartigan's algorithm sequentially assign points to clusters and stop once we go through the entire set of `n` data points without reassigning any point. The main difference is that MacQueen's algorithm swaps a point if it is closer to another center, while Hartigan's algorithm swaps a point if doing so would decrease the total sum of squared distances between points and their cluster center (in other words, it may switch one point to a further-away cluster if that would improve the overall distance from points to their cluster centers). These methods tend to take fewer iterations.
+
+Generally, Hartigan's algorithm is preferred as it is guaranteed to not do weird things; however, none of these methods are guaranteed to achieve the global optimum.
+
+If you want to change from the R default to the `Lloyd` or `Macqueen` algorithm, you can pass the argument `algorithm` to the `set_args` function.
+
+## Running the k-Means Clustering Model
+
+Since we've done a bunch of pre-processing steps, we should use a `workflow` to combine the k-means model and the pre-processing recipe.
+
+```{r set up kmeans}
+kmeans_wflow_fv <- workflow() |>
+  add_model(kmeans_model) |>
+  add_recipe(kmeans_recipe_fv)
+```
+
+### Tuning the Model
+
+The one weird thing is that we now need to pass a data frame instead of a list as our grid to search over. We should always include a minimum of 1 cluster and go up to some reasonable but small maximum. Here I've arbitrarily chosen 10 as it's very likely that our final number of clusters is much less than 10.
+
+## NOTE: SSTotal(Total squared distance from each points to global "mean".) = SSBetween + SSwithin(Total Squared distribution from each points to the "mean" of its cluster.)
+As K increases, SS within decreases
+```{r tune kmeans}
+set.seed(1002)
+fv_kfold_tidy <- vfold_cv(fv_train_tidy, v = 5, repeats = 1) 
+# grid is now expected to be a tibble or data frame instead of a list of named parameters
+nclusters_grid <- data.frame(num_clusters = seq(1, 10))
+
+kmeans_tuned_fv <- tune_cluster(kmeans_wflow_fv,
+                                resamples = fv_kfold_tidy,
+                                metrics = cluster_metric_set(sse_total, 
+                                                             sse_within_total, sse_ratio),
+                                grid = nclusters_grid)
+
+tuned_metrics <- collect_metrics(kmeans_tuned_fv)
+
+tuned_metrics |>
+  arrange(desc(.metric), num_clusters) |>
+  select(num_clusters, .metric, mean, everything())
+```
+
+1. What does `cluster_metric_set` do? What do `sse_total`, `sse_within_total`, and `sse_ratio` measure?
+
+### Choosing the Number of Clusters
+
+```{r scree plots}
+tuned_metrics |>
+  filter(.metric == "sse_ratio") |>
+  ggplot(aes(x = num_clusters, y = mean)) +
+  geom_point() + 
+  geom_line() +
+  labs(x = "Number of Clusters", y = "Mean WSS/TSS (5 folds)") +
+  scale_x_continuous(breaks = seq(1, 10))
+```
+
+1. How many clusters should we choose? Why?
+around 3 to 5 which are not really changed
+There is no metrices which one is better. Go back to Interpretability 
+
+```{r finalize kmeans workflow}
+kmeans_fv_3clusters <- kmeans_wflow_fv |>
+  finalize_workflow_tidyclust(parameters = list(num_clusters = 3))
+```
+
+### Fitting the Model
+
+```{r fit 3 cluster model}
+set.seed(56685) 
+# always reset the seed before you re-fit, just in case something weird happens
+
+kmeans_fv_fit3 <- kmeans_fv_3clusters |>
+  fit(data = fv_train_tidy)
+```
+
+Let's see what the cluster assignments look like:
+
+```{r cluster assignments3}
+assignments3 <- bind_cols(
+  fv_train_tidy,
+  kmeans_fv_fit3 |> extract_cluster_assignment())
+
+assignments3 |>
+  select(Food, .cluster, everything())
+```
+
+```{r plot clusters3, message = F, warning = F}
+library(GGally)
+ggpairs(assignments3, columns = c("Taste", "Cravings", "Healthiness"),
+        aes(color = .cluster)) # can put alpha inside aes
+```
+
+1. What are the characteristics of the red, green, and blue clusters?
+
+How about a 4-cluster model?
+
+```{r finalize kmeans workflow 4}
+kmeans_fv_4clusters <- kmeans_wflow_fv |>
+  finalize_workflow_tidyclust(parameters = list(num_clusters = 4))
+```
+
+```{r cluster assignments4}
+set.seed(56685)
+kmeans_fv_fit4 <- kmeans_fv_4clusters |>
+  fit(data = fv_train_tidy)
+
+assignments4 <- bind_cols(
+  fv_train_tidy,
+  kmeans_fv_fit4 |> extract_cluster_assignment())
+
+```
+
+```{r plot clusters4}
+ggpairs(assignments4, columns = c("Taste", "Cravings", "Healthiness"),
+        aes(color = .cluster))
+```
+```{r extract centers}
+kmeans_fv_fit3 %>% extract_centroids()
+kmeans_fv_fit4 %>% extract_centroids()
+```
+
+### Making Predictions
+
+Using `augment`, we can predict which cluster each of the observations in the test set is in. Remember that all of the transformation and normalization steps are done on the test set based on the values from the *training* dataset. We just let the recipe take care of this rather than coding it ourselves.
+
+```{r augment 3-cluster}
+predictions3 <- augment(kmeans_fv_fit3, 
+                        new_data = fv_test_tidy)
+ggpairs(predictions3, columns = c("Taste", "Cravings", "Healthiness"),
+        aes(color = .pred_cluster))
+```
+
+If we want to see whether the predictions are any good, we can combine the clusters in the training set with the clusters predicted from the test set and see how well they overlap.
+
+```{r plot everything 3 clusters}
+all_clusters3 <- bind_rows(
+  assignments3,
+  predictions3 |> rename(.cluster = .pred_cluster) # rename cluster variable name
+)
+ggpairs(all_clusters3, columns = c("Taste", "Cravings", "Healthiness"),
+        aes(color = .cluster))
+```
+
+## Downsides to k-Means Clustering
+
+As an unsupervised learning algorithm, we have no good way to validate that we would get the same clusters on a new sample, and we have no clear metrics that would allow us to determine whether .
+
+Additionally, k-means clustering can be heavily affected by the presence of outliers that should not be placed in any cluster. Sometimes using "one extra" cluster will fix the issue, but often dealing with one extreme outlier will distort what the other clusters look like.
+
+## Model-Based Clustering
+
+Model-based clustering is sometimes referred to as "soft k-means clustering." Instead of assigning each observation to a specific cluster, model-based clustering assumes a specific distribution shape within each cluster, automatically finds the optimal number of clusters based on that shape, and finds the predicted probability of each point belonging to each cluster.
+
+This approach makes it much easier to handle outliers. 
+
+### Model-Based Clustering with `mclust`
+
+```{r new packages mclust, warning = FALSE, message = FALSE}
+library(mclust)
+```
+
+Model-based clustering with `mclust` assumes a multivariate normal distribution for the set of predictors. Therefore, it is important to convert categorical variables to indicator variables and remove zero-variance variables; however, scaling is unnecessary. Also, the model assumes multivariate normality *within each cluster*, so transformation of the predictors is generally unnecessary as points far out in the tail(s) will get mapped to their own cluster.
+
+Since we only have numerical predictors here, there is no need to pre-process the data.
+
+The `mclust` package searches over many possible combinations of similarities/differences in the shape, size (volume), and orientation of the groups' distributions. Each combination is represented by a three-letter code. See <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5096736/figure/F2/> for an illustration of the different combinations in 2-dimensional space.
+
+### Parameters to Tune
+
+None! Technically there are two parameters to tune:
+
+* The number of clusters
+* The shape of the density function within the clusters
+
+However, the `mclust` package automatically searches over the entire parameter space, so we don't need to actually *tune* anything.
+
+### Running the Model
+
+Since `mclust` doesn't (yet?) work with tidymodels, we have to do the pre-processing ourselves. Luckily there is not much pre-processing to do, and we can use the same tricks we saw in the Chapter 6 lab.
+
+```{r run the clustering}
+## Create indicator variables using model.matrix
+fv_train_predictors <-  model.matrix(~Taste + Cravings + Healthiness,
+                                     data = fv_train_tidy)[,-1]
+
+mclust1 <- mclust::Mclust(fv_train_predictors, G = 1:9)
+summary(mclust1)
+plot(mclust1, "BIC")
+```
+
+1. Briefly explain how to read this plot. How was the "3-component EEE" model determined to be the best?
+
+```{r tidy mclust}
+tidy.mclust1 <- broom::tidy(mclust1)
+print(tidy.mclust1)
+```
+
+2. How do we read this table? What do the foods in each cluster have in common?
+
+```{r classification plot}
+plot(mclust1, "classification")
+```
+
+3. Briefly explain how to read this plot. Based on your answer to Question #2, which cluster is the red cluster? Blue cluster? Green cluster?
+
+4. Notice that there is more "overlap" between the clusters - for example, some blue dots are closer to the red mean than the blue mean by Euclidean distance. Why is this?
+
+```{r augment with test set}
+augmented.mclust1 <- broom::augment(mclust1, fv_train_tidy)
+augmented.mclust1 |>
+  dplyr::select(Food, .class, .uncertainty, everything())
+hist(augmented.mclust1$.uncertainty)
+```
+
+5. What do the `.class` and `.uncertainty` columns indicate?
+
+```{r uncertainty plot}
+plot(mclust1, "uncertainty")
+```
+
+6. What do bigger and darker circles indicate on this plot?
+
+You can also use the `factoextra` package to make ggplot2-based versions of the same plot:
+
+```{r}
+library(factoextra)
+fviz_mclust(mclust1, what = "BIC")
+fviz_mclust(mclust1, what = "classification")
+fviz_mclust(mclust1, what = "uncertainty", palette = "simpsons")
+```
+
+The main difference is that the `factoextra` versions of the classification and uncertainty plots use the first two principal components as the x-axis and y-axis instead of creating a `pairs` plot to show the clusters' relationships with each variable.
+
+### Making Predictions with `mclust`
+
+```{r make predictions}
+mclust_predictions <- predict(mclust1, newdata = fv_test_tidy |>
+  dplyr::select(Taste, Cravings, Healthiness))
+mclust_predictions
+```
+
+1. What do the `$classification` and `$z` objects represent?
+
+Unfortunately, there is no `tidy` method available, so we have to augment the test set ourselves.
+
+```{r manually augment df}
+fv_test_augmented <- fv_test_tidy |>
+  mutate(`.class` = predictions$classification,
+         `.pred_cluster1` = predictions$z[,1],
+         `.pred_cluster2` = predictions$z[,2],
+         `.pred_cluster3` = predictions$z[,3]) |>
+  mutate(`.uncertainty` = 1 - case_when(`.class` == 1 ~ `.pred_cluster1`,
+                                        `.class` == 2 ~ `.pred_cluster2`,
+                                        `.class` == 3 ~ `.pred_cluster3`))
+fv_test_augmented |>
+  dplyr::select(
+    Food, .class, .uncertainty, .pred_cluster1, .pred_cluster2, .pred_cluster3, everything()
+  )
+```
+
+There is *a lot* more that you can do with this package, but this hopefully gives you the basic idea.

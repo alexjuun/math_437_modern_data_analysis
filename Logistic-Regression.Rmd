@@ -1,0 +1,499 @@
+---
+title: "Logistic Regression: Worked Examples"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## The Data
+
+Logistic regression requires that we have a binary response variable. So we'll work with the Restrain Food Database again, but we need to use the situation where we're trying to predict if a food is a fruit or a vegetable.
+
+```{r import data, message = F, warning = F}
+library(tidyverse)
+Restrain <- readr::read_csv("Restrain.csv")
+fv <- Restrain |>
+  filter(SubCategory %in% c("Fruits", "Vegetables"))
+```
+
+## The Logistic Regression Model
+
+The basic modeling machinery is *very* picky about character vectors as the response variable, and we need to convert to factor. It's generally a good idea to do this anyway:
+
+```{r convert to factor}
+fv$SubCategory <- factor(fv$SubCategory, levels = c("Fruits","Vegetables"))
+```
+
+First we do our training-holdout split:
+
+```{r split}
+set.seed(1003)
+n <- nrow(fv)
+test.rows <- sample(n, floor(0.20*n), replace = FALSE)
+fv_train <- fv[-test.rows,]
+fv_test <- fv[test.rows,]
+```
+# Note:Logistic Regression Model
+Let Y_i ~ Bernoulli(p_i)
+The y_i's are not iid because p_i depends on x_i (predictors). We are not doing y_i = B_o + b_ix_i + E_i, y_i = 0 or 1. 
+Transfrom p_i that we can plug in any real numbers.
+Our model:
+f(p_i)= B_0 + B_ix_i + E_i
+Option 1: "Probit" Regression
+f(p_i) = Φ^-1 (p_i) converts p to z-score
+Φ(z)= P((Z<z) when Z~N(0,1))
+Option 2: Logistic Regression
+f(p_i)=log(p_i/(1-p_i)) called "log odds" or "logit"
+
+log(p_i/(1-p_i)) = B_0 + B_ix_i (don't care about E since it is already modeled with p_i)
+p_i = e^B_0_B_iX_i / 1+ e^B_0_B_iX_i "Logistic function"
+
+B_j represents the increase in log-odds associated with one-unit increase in x_i, holding as all other as variables in model constant.
+e^B_j is called the "odds ratio" - multiplicative increase in odds associate with one unit increase in x, (holding everything else constant)
+
+
+
+The workhorse function is `glm`, which stands for Generalized Linear Model. First let's see how it works with just one predictor, `Taste`:
+
+```{r glm-error, eval = F}
+logr1 <- glm(SubCategory ~ Taste, data = fv_train)
+```
+
+1. What's the problem here?
+
+```{r glm-no error}
+logr1 <- glm(SubCategory ~ Taste, data = fv_train, family = "binomial")
+summary(logr1)
+```
+#Notes Logistic Regression: 
+The Bhat estimates maximize likelihood function(joint pdf of y given xand B, expressed as a function of B)
+2. The coefficient corresponding to `Taste` is -0.06546. How do we interpret this coefficient? when the taste is increasing by one,  vegetable of log odd is decreased by 0.06546
+
+```{r check levels}
+contrasts(fv_train$SubCategory)
+```
+
+To find the *actual* (multiplicative) change in odds:
+
+```{r change in odds}
+exp(coef(logr1)[2])
+```
+It is odds not an probability
+
+What does the actual function look like?
+
+```{r plot logistic function}
+b <- coef(logr1)
+x <- seq(0, 100)
+plot(x, exp(b[1] + b[2]*x)/(1 + exp(b[1] + b[2]*x)), type = "l", 
+     xlab = "Taste", ylab = "P(Vegetable)")
+```
+
+Sometimes it helps to re-define the reference level so that you are talking about a multiplicative increase in odds:
+
+```{r glm reverse ref level}
+fv_train2 <- fv_train |>
+  mutate(
+    SubCategory = factor(SubCategory, levels = c("Vegetables", "Fruits"))
+  )
+
+logr2 <- glm(SubCategory ~ Taste, data = fv_train2, family = "binomial")
+summary(logr2)
+```
+
+Notice that the coefficient changed signs. How do the probabilities change?
+
+```{r plot logistic function 2}
+b2 <- coef(logr2)
+plot(x, exp(b[1] + b[2]*x)/(1 + exp(b[1] + b[2]*x)), type = "l", 
+     xlab = "Taste", ylab = "P(Vegetable)", ylim = c(0, 1))
+lines(x, exp(b2[1] + b2[2]*x)/(1 + exp(b2[1] + b2[2]*x)), col = "red")
+axis(side = 4, col = "red", col.ticks = "red", labels = FALSE)
+mtext("P(Fruit)", side = 4, line = 1, col = "red") 
+```
+
+## Making Predictions
+
+```{r predictions}
+logr_predictions <- predict(logr1, newdata = fv_test)
+
+tibble(Food = fv_test$Food, 
+       Taste = fv_test$Taste, 
+       SubCategory = fv_test$SubCategory, 
+       prediction = logr_predictions)
+```
+
+1. What are these predictions?
+
+To make predictions, we first need to convert these numbers to probabilities:
+
+```{r predict actual probabilities}
+predicted_probs <- predict(logr1, newdata = fv_test, type = "response")
+tibble(Food = fv_test$Food, 
+       Taste = fv_test$Taste, 
+       SubCategory = fv_test$SubCategory, 
+       prediction = predicted_probs)
+#Prediction to be a vegetables
+```
+
+We can now use the Bayes decision boundary:
+
+```{r Bayes classification}
+p.threshold <- 0.5
+
+#Use if_else from dplyr to do the prediction
+predicted_category <- if_else(predicted_probs > p.threshold, 
+                              "Vegetables", 
+                              "Fruits")
+
+logr_prediction <- tibble(Food = fv_test$Food,
+                          Taste = fv_test$Taste, 
+                          SubCategory = fv_test$SubCategory,
+                          pred_prob = predicted_probs, 
+                          pred_class = predicted_category
+                          ) 
+
+logr_prediction
+```
+
+We can get the accuracy of our predictions:
+
+```{r pred accuracy}
+table(logr_prediction$pred_class, 
+      logr_prediction$SubCategory, 
+      dnn = c("Predicted","Actual"))
+```
+
+We correctly predicted all 12 vegetables but only 2 of the 8 fruits, for a total of 70% accuracy.
+
+## Multiple Logistic Regression
+
+```{r multiple logr}
+logr_multiple <- glm(SubCategory ~ Taste + Healthiness + Cravings,
+                     data = fv_train,
+                     family = "binomial")
+summary(logr_multiple)
+```
+
+2. The coefficient corresponding to `Taste` is -0.09114. How do we interpret this coefficient?
+
+Based on our interpretation, we still need to worry about collinearity and multicollinearity issues. We can use `vif` to check this:
+
+```{r collinearity, message=F, warning =F}
+library(car)
+vif(logr_multiple)
+```
+
+
+3. In the chunk below, write code to obtain the predicted probabilities, predicted classes, and accuracy of the model for the validation set.
+
+```{r pred accuracy multiple logistic regression}
+
+```
+
+## Logistic Regression with Tidymodels
+
+```{r validation split, message = F, warning = F}
+library(tidymodels) # load everything we need
+set.seed(1880)
+fv_split <- initial_split(fv, prop = 0.80) 
+
+fv_train_tidy <- training(fv_split)
+fv_valid_tidy <- testing(fv_split)
+```
+
+### Fit the Model
+
+It is good practice to set up a new workflow every time you want to run a new model.
+
+```{r workflow}
+logr_model <- logistic_reg(mode = "classification", engine = "glm")
+
+logr_wflow <- workflow() |>
+  add_model(logr_model)
+```
+
+We don't need to pre-process anything here. Our predictors are on the scale where a one-unit change is meaningful. So all we need to do in our recipe is indicate the formula we want to use.
+
+```{r create recipe}
+logr_recipe <- recipe(
+  SubCategory ~ Taste + Cravings + Healthiness, # response ~ predictors
+  data = fv_train_tidy
+)
+
+logr_wflow <- logr_wflow |>
+  add_recipe(logr_recipe)
+```
+
+Now we can `fit` the model:
+
+```{r fit model}
+logr_fit <- fit(logr_wflow, data = fv_train_tidy)
+logr_fit
+```
+
+### Making Predictions with `tidymodels`
+
+As usual, we use the `predict` function to make predictions:
+
+```{r make predictions}
+logr_predictions_tidy <- predict(logr_fit, new_data = fv_valid_tidy) #newdata for regular glm new_data for tidymodels
+logr_predictions_tidy
+```
+
+```{r make probabilistic predictions}
+logr_predictions_raw <- predict(logr_fit, new_data = fv_valid_tidy, type = "prob")
+logr_predictions_raw
+```
+
+1. What is the difference between the way these predictions are reported and the way they were reported without using `tidymodels`?
+glm we needed to figure out which prediction is veg or fruits. However, tidymodels generates both predictions of fruits and veges.
+
+We can also use `augment` to add the predictions to the original data frame:
+
+```{r augment}
+predictions_df <- broom::augment(logr_fit, new_data = fv_valid_tidy, type = "prob")
+predictions_df |>
+  dplyr::select(
+    Food,
+    SubCategory, 
+    .pred_class, 
+    .pred_Fruits, 
+    .pred_Vegetables, 
+    everything() # keep everything else but move it to the end
+    )
+```
+
+The accuracy of our predictions can be obtained using the `yardstick` package:
+
+```{r accuracy}
+accuracy(predictions_df, truth = SubCategory, estimate = .pred_class)
+```
+
+The same model, on this validation set, achieved 85.7% (18/21) accuracy.
+
+
+## Multinomial Logistic Regression
+
+The multinomial distribution is the generalization of the binomial distribution to more than two categories. In a similar way, we can generalize logistic regression to "multinomial" logistic regression when our response variable has more than two categories.
+
+The two main functions I use to do this are `VGAM::vglm` and `nnet::multinom`. I find that `vglm` is more generalizable, but it doesn't play nice with `tidymodels`, so we'll use `multinom` instead.
+
+In our example, we're going to try to predict (similarly to when we used k-nn) whether a food is sweet, savory, takeout or fruit/vegetable.
+
+```{r multinomial data prep}
+library(forcats) # tidyverse for factors
+Restrain2 <- Restrain |> mutate(SubCategory =
+  fct_collapse(SubCategory,
+    savory = c("Bakery (savoury)", "Savoury snacks"),
+    sweet = c("Bakery (sweet)", "Biscuits", "Confectionery", "Desserts"),
+    takeout = c("Takeaway (chain)", "Takeaway (generic)"),
+    fruit_veggie = c("Fruits", "Vegetables")
+  )
+)
+
+n <- nrow(Restrain2)
+set.seed(1003)
+# Selecting a random sample of 20% of rows to be in the holdout set
+test.rows <- sample(n, floor(0.20*n), replace = FALSE)
+Restrain_train <- Restrain2[-test.rows,]
+Restrain_valid <- Restrain2[test.rows,]
+```
+
+The `nnet` package comes with most base R installations (you should have it already) and does basic neural networks.
+
+```{r fit multinomial model}
+library(nnet)
+mlogr_model <- multinom(SubCategory ~ Taste, data = Restrain_train)
+summary(mlogr_model) 
+```
+# Response variables: sweet fruit_veggie takeout Predictor: Taste
+The single most critical thing to understand to interpret this output is the reference level for the response variable.
+
+1. What is the reference level for `SubCategory`? 
+savory log odds compared to savory
+If we have $K$ groups, the Coefficients table then provides the information we need to make $K-1$ logistic regression equations:
+
+$$
+log\left(\frac{P(sweet)}{P(savory)}\right) = -0.542 + (0.033) \times Taste
+$$
+
+$$
+log\left(\frac{P(fruit\_veggie)}{P(savory)}\right) = 0.668 + (-0.005) \times Taste
+$$
+
+$$
+log\left(\frac{P(takeout)}{P(savory)}\right) = -1.828 + (0.045) \times Taste
+$$
+
+If we change the reference level, then all of our equations change:
+
+```{r fit multinomial model-2}
+Restrain_train2 <- Restrain_train |>
+  mutate(SubCategory = relevel(SubCategory, ref = "sweet"))
+mlogr_model2 <- multinom(SubCategory ~ Taste, data = Restrain_train2)
+summary(mlogr_model2) 
+```
+
+$$
+log\left(\frac{P(savory)}{P(sweet)}\right) = 0.542 + (-0.033) \times Taste
+$$
+
+$$
+log\left(\frac{P(fruit\_veggie)}{P(sweet)}\right) = 1.210 + (-0.037) \times Taste
+$$
+
+$$
+log\left(\frac{P(takeout)}{P(sweet)}\right) = -1.286 + (0.012) \times Taste
+$$
+
+### Predicting with Multinomial Logistic Regression
+
+If we just call `predict` with our validation set, we just get the predicted category:
+
+```{r predictions classes}
+mlogr_predictions <- predict(mlogr_model, newdata = Restrain_valid)
+
+mlogr_df <- tibble(Food = Restrain_valid$Food, 
+       Taste = Restrain_valid$Taste, 
+       SubCategory = Restrain_valid$SubCategory, 
+       prediction = mlogr_predictions)
+
+mlogr_df
+```
+
+If we want the probabilities of being in each class, we need to include `type = "prob"`:
+
+```{r predictions classes}
+mlogr_predictions2 <- predict(mlogr_model, 
+                             newdata = Restrain_valid,
+                             type = "prob")
+
+mlogr_pred_cat <- tibble(
+    Food = Restrain_valid$Food, 
+    Taste = Restrain_valid$Taste, 
+    SubCategory = Restrain_valid$SubCategory) |>
+  bind_cols(mlogr_predictions2)
+
+mlogr_pred_cat
+```
+
+1. Briefly explain how these probabilities are calculated.
+
+```{r accuracy of single-variable model}
+table(mlogr_predictions, Restrain_valid$SubCategory,
+      dnn = c("Predictions", "Truth"))
+accuracy(mlogr_df, truth = SubCategory, estimate = prediction)
+```
+
+2. The table shown is called a *confusion matrix*. Briefly explain how to read the confusion matrix.
+#rows: predictions columns: actual truth
+Hmm...maybe predicting just based on Taste isn't such a good idea. Let's see what the predictions look like when we add in the Healthiness and Cravings predictors:
+
+```{r multiple mlogr}
+mlogr_multiple <- multinom(
+  SubCategory ~ Taste + Healthiness + Cravings,
+  data = Restrain_train)
+summary(mlogr_multiple)
+```
+
+```{r predictions with multiple}
+mlogr_multiple_pred_class <- predict(mlogr_multiple, 
+                                      newdata = Restrain_valid)
+
+mlogr_multiple_pred_prob <- predict(mlogr_multiple,
+                                    newdata = Restrain_valid,
+                                    type = "prob")
+
+mlogr_multiple_df <- tibble(Food = Restrain_valid$Food, 
+       SubCategory = Restrain_valid$SubCategory, 
+       pred_class = mlogr_multiple_pred_class) |>
+  bind_cols(mlogr_multiple_pred_prob)
+
+mlogr_multiple_df
+```
+
+```{r accuracy of multi-variable model}
+table(mlogr_multiple_pred_class, Restrain_valid$SubCategory,
+      dnn = c("Predictions", "Truth"))
+accuracy(mlogr_multiple_df, truth = SubCategory, estimate = pred_class)
+```
+
+## Multinomial Logistic Regression with `tidymodels`
+
+As usual, we start by creating our training/holdout split.
+
+```{r initial split with tidymodels, message = F, warning = F}
+# rsample was loaded with tidymodels earlier
+set.seed(1880)
+Restrain_split <- initial_split(Restrain2, prop = 0.80) 
+Restrain_train2 <- training(Restrain_split)
+Restrain_valid2 <- testing(Restrain_split)
+```
+
+Next we specify the model. The model type we want is called `multinom_reg`:
+
+```{r workflow, message = F, warning = F}
+# workflows and parsnip were loaded with tidymodels earlier
+
+multinom_model <- multinom_reg(mode = "classification",
+                               engine = "nnet")
+# engine = "nnet" ensures we use the same multinom() function
+# as we did without tidymodels
+  
+multinom_wflow <- workflow() |>
+  add_model(multinom_model)
+```
+
+Since we only have numerical predictors, we don't need to do any pre-processing. If we had categorical predictors, it's good practice to convert them to indicator variables using a new step in the recipe.
+
+```{r recipe, message = F, warning = F}
+# recipes was loaded with tidymodels earlier
+
+multinom_recipe <- recipe(
+  SubCategory ~ Taste + Cravings + Healthiness, # response ~ predictors
+  data = Restrain_train2
+) |>
+  # convert categorical predictors to indicators
+  # here it won't do anything because all predictors are numeric
+  step_dummy(all_nominal_predictors())
+
+multinom_wflow <- multinom_wflow |>
+  add_recipe(multinom_recipe)
+
+```
+
+Now we `fit` the model we specified in our workflow:
+
+```{r fit multinom}
+multinom_fit <- fit(multinom_wflow, data = Restrain_train2)
+multinom_fit
+```
+
+Finally, we use `augment` to make predictions on the validation set and add them to the original data frame:
+
+```{r augment}
+# broom was loaded with tidymodels earlier
+predictions_df <- augment(multinom_fit, 
+          new_data = Restrain_valid2, type = "prob")
+predictions_df |> dplyr::select(
+  Food,
+  SubCategory, 
+  .pred_class, 
+  .pred_savory, 
+  .pred_sweet, 
+  .pred_fruit_veggie, 
+  .pred_takeout,
+  everything())
+```
+
+Finally, we look at our confusion matrix and estimate our prediction accuracy.
+
+```{r accuracy with tidymodels, message = F, warning = F}
+# yardstick was loaded with tidymodels earlier
+conf_mat(predictions_df, truth = SubCategory, estimate = .pred_class)
+accuracy(predictions_df, truth = SubCategory, estimate = .pred_class)
+```

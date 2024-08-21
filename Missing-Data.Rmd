@@ -1,0 +1,482 @@
+---
+title: 'Dealing with Missing Data Example Code and Class Activities'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data
+
+We're going to use a new dataset now: the dino data contains information about 89 dinosaur skeletons, specifically the length of 7 different bones (scapula, humerus, radius, femur, tibia, and left third metacarpal and metatarsal). Many of the skeletons are incomplete, so there is quite a bit of missing data.
+
+```{r load dinosaur data}
+library(readxl)
+dino <- read_excel("dinosaur-bone-lengths.xlsx")
+```
+
+We are going to explore a few different methods for dealing with this missingness. 
+
+Typically, in predictive modeling, single imputation methods are applied to the training set, and the results applied to the test set. In inferential modeling, a test set is often not used, and multiple imputation methods create multiple "copies" of the dataset to use for inference.
+
+The `recipes` package in `tidymodels` includes a number of single imputation procedures, so we'll explore single imputation with `tidymodels`. For multiple imputation, we'll look at both the `softImpute` package that contains the algorithm used by the textbook and the `mice` package that is one of the standard packages in R for dealing with missing data.
+
+## Visualizing the Missingness
+
+We are interested in columns 5-11 of our dino data. These columns contain the lengths of dinosaur bones.
+
+```{r get missingness}
+missingness <- t(apply(dino[,5:11], 2, \(x) is.na(x) |> as.numeric()))
+```
+
+apply function 2 meaning using cloumn
+
+ The `\(x)` syntax is essentially shorthand for `function(x)`. Our output will be 1 if the value is missing and 0 if the value is present.
+
+Now we have a matrix in which each variable is on the row and each column represents one observation. The reason that we do this is that the *variable* is the observation of interest. Now we can plot the pattern of missingness:
+
+```{r plot missingness}
+library(stringr)
+library(tidyverse)
+library(tidymodels)
+heatmap(missingness, labCol = 
+          str_c(dino$GenusFinal |> str_sub(1,1), # First letter
+                ". ",
+                dino$SpeciesFinal), col = c("yellow", "red"))
+```
+yellow is covred, red is missing.
+
+The tree-like objects on the top and left of the plot are called dendrograms and group observations (top) and variables(left) with similar patterns of missingness (top). Dendrograms are covered in Section 12.4.2 of the textbook, which unfortunately we will not have time to cover.
+
+labcol, fix the column nable
+str_c(paste of things together from the sentence), str_sub(extract substring)
+Note that when we have a lot of observations and/or a lot of variables to look at, this heat map may not be super-informative or easy to plot.
+
+To summarize patterns of missingness, we can use the `mice` package:
+
+```{r mdpattern}
+library(mice)
+md.pattern(dino[,5:11],
+           rotate.names = TRUE)
+```
+red missing, blue not missing. right number are the number of missing number, numbers of observations are left(30 dinosaurs)
+
+##Note
+Missing Completely at Random (MCAR): Total random fluke that the data value was not recorded.
+Reason for missingness is unrelated to value of anything in "complete" data. 
+
+Missing at Random(MAR):
+Reason for missingness is related to values of variables that were recorded.
+-> Most imputation methods work here. We use the known values to "guess" what the missing values would be.
+
+Not Missing at Random (NMAR):
+Reason for r missingness is related to the value that would have been recorded.
+-> Nonresponse bias
+-> sometimes, censored data
+
+## Mean/Median/Mode Imputation
+
+The simplest method is to replace the missing values with the average (or median) non-missing value in the training set. This method is called mean (or median) imputation.
+
+```{r split training-test}
+set.seed(395)
+dino_split <- initial_split(dino, prop = 0.80) 
+
+dino_train <- training(dino_split)
+dino_test <- testing(dino_split)
+```
+
+```{r mean imputation}
+mean_imputation <- recipe(~ Scapula + Humerus + Radius +
+                            `MC III L` + Femur + Tibia + `MT III L`,
+                          data = dino_train) |>
+  step_impute_mean(all_numeric_predictors())
+
+mean_imputation_prep <- mean_imputation |>
+  prep()
+
+mean_imputation_prep
+```
+
+```{r bake mean imputation}
+mean_imputation_prep |>
+  bake(new_data = NULL)
+
+mean_imputation_prep |>
+  bake(new_data = dino_test)
+```
+
+1. What is being imputed for the missing values of `Scapula`?
+500.6042
+2. Why do we impute the same value for the training and test sets?
+
+To impute the median instead, we use `step_impute_median()`. For categorical data, the equivalent is to replace the missing values with the most common non-missing value in the training set (mode imputation). The function is, intuitively, `step_impute_mode()`.
+
+### Why Not to Use Mean/Median/Mode Imputation
+
+```{r scatterplots imputed vs not}
+ggplot(dino_train,
+       aes(x = Scapula,
+           y = `MC III L`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE)
+
+mean_imputed_train <- mean_imputation_prep |>
+  bake(new_data = NULL)
+
+
+ggplot(mean_imputed_train,
+       aes(x = Scapula,
+           y = `MC III L`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE)
+```
+
+messed up the variance and covariance which messed up correlation
+
+```{r correlation imputed vs not}
+correlation_difference <- c(
+  not_imputed = with(dino_train, cor(Scapula, `MC III L`, use = "pairwise.complete.obs")),
+  imputed = with(mean_imputed_train, cor(Scapula, `MC III L`))
+    )
+
+correlation_difference
+```
+
+
+1. What do you notice about the difference in the scatterplots with the missing data removed vs. the missing data imputed using mean imputation?
+
+2. Why do you think the correlation decreased?
+adding same values most don't use the imputation when you have to get correlation
+## Single Imputation Using Supervised Learning Models
+
+There are three generally accepted model types to use for single imputation:
+
+1. Linear (or logistic, or multinomial logistic) regression
+2. k-nearest neighbors
+3. bagging
+
+#NOTE: for bagging, fast results 
+
+The idea in each case is to use the rows with non-missing data as a training set and the rows with missing data as a test set, and then replace the missing data with the predicted values.
+
+As far as I can tell, `tidymodels` implements linear regression, k-nn, and bagging for missing numeric variables, but only implements k-nn and bagging for categorical missing data.
+
+### Linear Model Imputation
+
+```{r impute lm}
+linear_imputation <- recipe(~ Scapula + Humerus + Radius +
+                            `MC III L` + Femur + Tibia + `MT III L`,
+                          data = dino_train) |>
+  step_impute_linear(Scapula,
+                     impute_with = imp_vars(Femur, Tibia))
+
+linear_imputation |>
+  prep() |>
+  bake(new_data = NULL)
+
+linear_imputation |>
+  prep() |>
+  bake(new_data = dino_test)
+```
+
+1. What is this warning? Why did we get imputed values in our test set but not our training set?
+NA in predictors as well
+
+### k-nn Imputation
+
+```{r impute knn}
+knn_imputation <- recipe(~ Scapula + Humerus + Radius +
+                            `MC III L` + Femur + Tibia + `MT III L`,
+                          data = dino_train) |>
+  step_impute_knn(Scapula,
+                     impute_with = imp_vars(Femur, Tibia))
+
+knn_imputation |>
+  prep() |>
+  bake(new_data = NULL)
+
+knn_imputation |>
+  prep() |>
+  bake(new_data = dino_test)
+```
+
+1. How did k-nn imputation deal with the missing data?
+
+With k-nn, it is possible to include a value in both the variables to impute and the variables to use for imputation. It does give similar warnings to `step_impute_linear` if there is so much missing data in a row that a value cannot be imputed.
+
+```{r impute knn-2}
+knn_imputation2 <- recipe(~ Scapula + Humerus + Radius +
+                            `MC III L` + Femur + Tibia + `MT III L`,
+                          data = dino_train) |>
+  step_impute_knn(all_predictors(),
+                     impute_with = all_predictors())
+
+knn_imputation2 |>
+  prep() |>
+  bake(new_data = NULL)
+
+knn_imputation2 |>
+  prep() |>
+  bake(new_data = dino_test)
+```
+
+### Bagging Imputation
+
+```{r impute bag}
+bag_imputation <- recipe(~ Scapula + Humerus + Radius +
+                            `MC III L` + Femur + Tibia + `MT III L`,
+                          data = dino_train) |>
+  step_impute_bag(Scapula,
+                     impute_with = imp_vars(Femur, Tibia))
+
+bag_imputation |>
+  prep() |>
+  bake(new_data = NULL)
+
+bag_imputation |>
+  prep() |>
+  bake(new_data = dino_test)
+```
+
+Bagging deals with missing predictors just fine, even if almost everything is missing in a row. It's a bit annoying to have to do imputation one variable at a time, but we can just tell it to impute all the missing data at once:
+
+```{r impute bag2}
+bag_imputation2 <- recipe(~ Scapula + Humerus + Radius +
+                            `MC III L` + Femur + Tibia + `MT III L`,
+                          data = dino_train) |>
+  step_impute_bag(all_predictors(),
+                     impute_with = imp_vars(all_predictors()))
+
+bag_imputation2 |>
+  prep() |>
+  bake(new_data = NULL)
+
+bag_imputation2 |>
+  prep() |>
+  bake(new_data = dino_test)
+```
+
+## Iterative Single Imputation Methods
+
+Iterative single imputation methods include the Expectation-Maximization Algorithm and the Matrix Completion algorithm introduced in Section 12.3. The idea is to minimize an objective function iteratively and choose the imputed values as those obtained at convergence.
+
+### Matrix Completion
+
+```{r load softImpute}
+library(softImpute)
+```
+
+Similar to `glmnet`, we have to convert our data from into a numeric matrix with NAs. Unfortunately, our `model.matrix` trick will not work as `model.matrix` removes missing data. So we will use `data.matrix` instead:
+
+```{r softImpute prep}
+dino_matrix <- data.matrix(
+  dino_train[c("Scapula", "Humerus", "Radius",
+               "MC III L", "Femur", "Tibia", "MT III L")]
+)
+
+dino_matrix
+```
+
+Somewhat confusingly, the `softImpute` function with the defaults actually uses the "Hard-Impute" algorithm:
+
+```{r softImpute}
+dino_softimpute <- softImpute(dino_matrix,
+           type = "svd") # type = "als" is often faster but does not match the book's algorithm 
+```
+
+To get the imputed values, we can use `complete`:
+
+```{r softImpute imputations}
+dino_matrix_completed <- dino_matrix |> 
+  softImpute::complete(
+    dino_softimpute
+)
+
+dino_matrix_completed
+```
+
+If you want to use penalized regression with `glmnet`, you can use the `softImpute` and `glmnet` together". To illustrate, let's predict Scapula from the Clade and other bone lengths:
+
+```{r softimpute with glmnet}
+library(glmnet)
+
+## New training-test split based on missing scapula values
+dino_train2 <- dino |>
+  filter(!is.na(Scapula))
+
+dino_test2 <- dino |>
+  filter(is.na(Scapula))
+
+dino_x <- makeX( # makeX is in glmnet
+  train = dino_train2[,c(1, 6:11)],
+  test = dino_test2[,c(1, 6:11)]
+  # there's an option na.impute = TRUE that does mean imputation instead
+  # but here we'll use softImpute
+)
+
+dino_train_impute <- softImpute(dino_x$x, type = "svd")
+
+# impute the missing predictors on the training set
+dino_train_x <- softImpute::complete(
+  dino_x$x,
+  dino_train_impute
+)
+
+# impute the missing predictors on the test set, using the svd from the training set
+dino_test_x <- softImpute::complete(
+  dino_x$xtest,
+  dino_train_impute
+)
+
+# run the cv
+dino_glmnet <- cv.glmnet(
+  x = dino_train_x,
+  y = dino_train2$Scapula
+)
+
+# make predictions on the test set
+dino_predictions <- predict(
+  dino_glmnet,
+  newx = dino_test_x,
+  s = dino_glmnet$lambda.1se
+)
+
+dino_test_pred <- dino_test2 |>
+  mutate(
+    .pred = dino_predictions[,1]
+  ) 
+
+dino_test_pred |>
+  dplyr::select(GenusFinal, SpeciesFinal, .pred, everything())
+```
+
+## Comparing Imputation Techniques
+
+```{r compare imputation}
+bag_completed <- bag_imputation2 |>
+  prep() |>
+  bake(new_data = NULL)
+
+imputed_values <- data.frame(
+  bone = rep(colnames(dino_matrix), apply(dino_matrix, 2, \(x) sum(is.na(x)))), # missing variables, repeated twice
+  bagging = as.matrix(bag_completed)[is.na(dino_matrix)],
+  matrix_completion = dino_matrix_completed[is.na(dino_matrix)]
+)
+
+ggplot(imputed_values,
+       aes(x = bagging, fill = bone)) +
+  geom_histogram(center = 25, binwidth = 50) +
+  scale_x_continuous(limits = c(-50, 1250))
+
+
+ggplot(imputed_values,
+       aes(x = matrix_completion, fill = bone)) +
+  geom_histogram(center = 25, binwidth = 50) +
+  scale_x_continuous(limits = c(-50, 1250))
+
+ggplot(imputed_values,
+       aes(x = bagging, y= matrix_completion, color = bone)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0)
+```
+
+Although the bagging and matrix completion imputation methods more-or-less agree, we can see that the matrix completion method produces more variable estimates. In particular, look at the distribution of imputed Scapula values. There is also one Humerus value that is clearly imputed wrong by the matrix completion method.
+
+Checking for implausibly imputed values is critical before doing any inference/prediction. This indicates that either we should not use the matrix completion-imputed values, or that perhaps transforming the data before imputation would be appropriate.
+
+## Multiple Imputation
+
+We will use the `mice` package to do the multiple imputation. The difference here is that we get *multiple* estimates of the missing values, rather than a single estimate.
+
+### Predictive Mean Matching
+
+The idea behind predictive mean matching is to predict the variable whose value is missing from other predictors and randomly pick the imputed value from the observations whose predicted values are "closest" to the predicted value of the missing data point.
+
+The `mice` package will do this `m` times:
+
+```{r pmm, eval = FALSE}
+dino_pmm <- mice(
+  dino_train[,5:11],
+  m = 5, # 5 times is the default,
+  seed = 18, # set a seed for reproducibility of the imputation
+  method = "pmm"
+)
+```
+
+This happens sometimes in R when you have spaces and other weird symbols in the variable names. The `janitor` package will deal with this nicely:
+
+```{r clean names}
+library(janitor)
+dino_train2 <- dino_train |>
+  clean_names()
+```
+
+Obviously we have to do the same thing with our test set:
+
+```{r clean names-2}
+dino_test2 <- dino_test |>
+  clean_names()
+
+head(dino_test)
+head(dino_test2)
+```
+
+Okay, now we have names that the `mice` package likes:
+
+```{r pmm2}
+dino_pmm <- mice(
+  dino_train2[,5:11],
+  m = 5, # 5 times is the default,
+  seed = 18, # set a seed for reproducibility of the imputation
+  method = "pmm"
+)
+
+plot(dino_pmm)
+```
+
+Now we can get the imputed datasets:
+
+```{r get imputed data}
+dino_pmm_imputed <- dino_pmm |>
+  mice::complete(action = "long")
+
+bind_rows(
+  head(dino_pmm_imputed, 3),
+  tail(dino_pmm_imputed, 3)
+)
+```
+
+We can now look at the distributions including the completed values:
+
+```{r plot imputed data}
+dino_pmm_imputed2 <- dino_pmm_imputed |>
+  mutate(
+    missing = rep(is.na(dino_train2$scapula), 5)
+  )
+ggplot(dino_pmm_imputed2,
+       aes(x = scapula, fill = missing)) +
+  geom_histogram(center = 500, binwidth = 100) +
+  facet_wrap(~.imp) +
+  scale_fill_manual(values = c("blue", "red"),
+                    labels = c("observed", "imputed"))
+```
+
+### Inference with `mice`
+
+Typically we are doing multiple imputation to allow us to perform statistical inference despite the missing data. For example, we can fit a linear regression model on each of the multiply imputed datasets.
+
+```{r fit lm}
+dino_lm <- with(dino_pmm,
+                lm(scapula ~ humerus + radius + mc_iii_l)
+)
+```
+
+We then *pool* the models together and obtain the relevant estimates and p-values:
+
+```{r pool lm}
+dino_pooled <- mice::pool(dino_lm)
+
+dino_pooled |> summary()
+```

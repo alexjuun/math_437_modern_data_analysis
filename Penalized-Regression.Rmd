@@ -1,0 +1,613 @@
+---
+title: "Penalized Regression Example Code and Class Activities"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+#Note:
+#Pre-processing for Ridge Regression:
+1. center the predictors to each have mean 0 -> ensure B_0 hat= ybar
+2. Scale predictors to have standard deviation = 1 
+-> ensures B_J hat is change in predictors y associated w. 1-SD increase in x_j
+-> this means that "less important" predictors will -> 0 faster regardless of measurement units
+
+
+## Data and Packages
+
+```{r create batting-2016 data, warning = FALSE, message = FALSE}
+library(Lahman)
+library(tidyverse)
+library(tidymodels)
+library(probably) # for calibration
+
+# Regression
+salaries <- Salaries %>%
+  dplyr::select(playerID, yearID, teamID, salary)
+peopleInfo <- People %>%
+  dplyr::select(playerID, birthYear, birthMonth, nameLast,
+         nameFirst, bats)
+batting <- battingStats() %>% 
+  left_join(salaries, 
+            by =c("playerID", "yearID", "teamID")) %>%
+  left_join(peopleInfo, by = "playerID") %>%
+  mutate(age = yearID - birthYear - 
+           1L *(birthMonth >= 10)) %>%
+  arrange(playerID, yearID, stint)
+
+batting_2016 <- batting %>% filter(yearID == 2016,
+                                   !is.na(salary),
+                                   G >= 100, AB >= 200
+                                   ) %>%
+  mutate(salary = log10(salary), # there's a reason for this, I promise
+         lgID = factor(lgID, levels = c("AL", "NL"))) # fix the defunct league issue
+
+set.seed(11249)
+batting_2016_split <- initial_split(batting_2016, prop = 0.75)
+batting_train <- training(batting_2016_split)
+batting_test <- testing(batting_2016_split)
+
+# Classification
+Restrain <- readr::read_csv("Restrain.csv")
+fv <- Restrain |>
+  filter(SubCategory %in% c("Fruits", "Vegetables"))
+fv$SubCategory <- factor(fv$SubCategory, levels = c("Fruits","Vegetables"))
+
+set.seed(1880)
+fv_split <- initial_split(fv, prop = 0.80) 
+
+fv_train_tidy <- training(fv_split)
+fv_valid_tidy <- testing(fv_split)
+```
+
+## Ridge Regression with tidymodels
+
+```{r ridge-tidy model}
+ridge_model <- linear_reg(mode = "regression", engine = "glmnet",
+                          penalty = tune(), # let's tune the lambda penalty term
+                          mixture = 0) # mixture = 0 specifies pure ridge regression
+
+ridge_wflow <- workflow() |>
+  add_model(ridge_model)
+```
+
+Notice that we included `penalty = tune()` - we are going to use cross-validation to determine the optimal penalty.
+
+We do need to do pre-processing here. Categorical predictors need to be converted to indicator variables and numerical predictors need to be centered/scaled:
+
+```{r ridge-tidy recipe}
+ridge_recipe <- recipe(
+  salary ~ G +  R + H + X2B + X3B + HR + RBI + 
+                   SB + CS + BB + SO + IBB + HBP + SH + SF + GIDP + 
+                   age + lgID, # response ~ predictors
+  data = batting_train
+) |>
+  step_normalize(all_numeric_predictors()) |> # don't scale the response
+  step_dummy(all_nominal_predictors())
+
+ridge_wflow <- ridge_wflow |>
+  add_recipe(ridge_recipe)
+```
+
+Now we can do the cross-validation. Since we only have one tuning parameter to worry about, we don't need to use `expand.grid`.
+
+```{r tune model kfold 1}
+set.seed(1332)
+batting_cv <- vfold_cv(batting_train, v = 10)
+
+ridge_tune1 <- tune_grid(ridge_model, 
+                      ridge_recipe, 
+                      resamples = batting_cv, 
+                      grid = grid_regular(penalty(range = c(-5, 2)), levels = 50))
+```
+
+An important note here is that the `range` argument is actually on the log10-scale, in other words, we are searching from $10^{-5}$ (essentially ordinary least-squares) to $10^2 = 100$.
+
+```{r tune model kfold 2}
+ridge_tune1 |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  ggplot(mapping = aes(x = penalty, y = mean)) + geom_point() + geom_line() +
+  scale_x_log10()
+```
+
+Finally, we replace the penalty value with the one that minimizes RMSE. Previously, we just used `select_best`, but notice here that basically anything under 0.1 gives more-or-less the same RMSE. So instead, we'll select the biggest lambda value within one standard error of the minimum RMSE:
+
+```{r select best ridge}
+ridge_best <- ridge_tune1 |>
+  select_by_one_std_err(
+    metric = "rmse",
+    desc(penalty) # order penalty from largest (highest bias = simplest model) to smallest
+)
+ridge_best
+
+ridge_wflow_final <- ridge_wflow |>
+  finalize_workflow(parameters = ridge_best) 
+```
+
+Probably good to do a model calibration check at this point:
+
+```{r ridge plot check}
+ridge_pred_check <- ridge_wflow_final |>
+  fit_resamples(
+    resamples = batting_cv,
+    # save the cross-validated predictions
+    control = control_resamples(save_pred = TRUE)
+) |> 
+  collect_predictions()
+
+# using built-in defaults from probably
+cal_plot_regression(
+  ridge_pred_check,
+  truth = salary,
+  estimate = .pred
+)
+```
+
+We noticed a similar prediction bias at low observed salaries with earlier models, but what the heck is going on with that point way up at the top of the graph?
+
+It's a bit difficult to find who the point actually corresponds to. We have to first find the row number in the training set, and then filter the training set to just that row.
+
+```{r check players}
+weird_players <- ridge_pred_check |>
+  filter(.pred > 7.5) |>
+  pull(.row) # get the row numbers
+
+batting_train |>
+  slice(weird_players) |>
+  dplyr::select(
+    nameFirst,
+    nameLast,
+    salary,
+    age
+  )
+```
+
+Assuming we're okay with this lack of great calibration, we fit the finalized model on the training set:
+
+```{r fit ridge-tidy model}
+ridge_fit <- ridge_wflow_final |>
+  fit(data = batting_train)
+ridge_fit
+```
+
+Notice that the fitting function essentially ignores all the tuning we were doing. It turns out that there is a very good reason for this, which gets around some weird issues in the `glmnet` code. If you're interested, look up the details at <https://parsnip.tidymodels.org/reference/glmnet-details.html>.
+
+```{r look at ridge path}
+ridge_fit |>
+  extract_fit_engine() |>
+  plot(xvar = "lambda", label = TRUE)
+```
+
+The plot above shows the regularization path for each coefficient, labeled with the predictor number in the recipe (i.e., 1 = G, 18 = lgID). This mapping can get a little bit wacky when you have multiple indicator variables for the same categorical predictor. The numbers on top of the plot indicate the number of variables in the model at the corresponding values of $\lambda$; unsurprisingly, because this is ridge regression, every model includes all 18 variables.
+
+# Note:
+18 are non-zero slopes
+
+if slopes remains it as it is more important, if it shrink fast toward the 0 it is less important predictors.
+
+However, our chosen penalty $lambda$ does get included when we obtain the coefficient estimates:
+
+```{r get coefficient estimates ridge}
+ridge_coef <- ridge_fit |>
+  broom::tidy()
+ridge_coef
+```
+
+and when we make predictions:
+
+```{r augment ridge fit}
+predictions_ridge <- ridge_fit |>
+  broom::augment(new_data = batting_test)
+predictions_ridge |>
+  dplyr::select(
+    nameFirst, 
+    nameLast, 
+    salary, 
+    .pred,
+    everything()
+)
+
+rmse(predictions_ridge, truth = salary, estimate = .pred)
+```
+
+### Comparison of Ridge Regression and Ordinary Least-Squares Regression
+
+```{r ols model}
+ols_model <- linear_reg(mode = "regression", engine = "lm")
+
+ols_wflow <- workflow() |>
+  add_model(ols_model) |>
+  add_recipe(ridge_recipe) # same recipe so that we can directly compare coefficients
+
+ols_fit <- ols_wflow |>
+  fit(data = batting_train)
+
+ridge_coef |>
+  left_join(broom::tidy(ols_fit), 
+            by = "term", 
+            suffix = c("_ridge", "_ols")) |>
+  dplyr::select(term, estimate_ridge, estimate_ols)
+```
+
+Notice that most of the ridge regression coefficient estimates have been shrunk toward 0 and some have even changed sign (R, RBI). Remember that ridge regression is designed to deal with multicollinearity issues, which we definitely have here:
+
+```{r check vif}
+ols_fit |> 
+extract_fit_engine() |>
+  car::vif()
+```
+
+## LASSO with tidymodels
+
+Literally everything is the same except that we now use `mixture = 1`:
+
+```{r Lasso-tidy model}
+lasso_model <- linear_reg(mode = "regression", engine = "glmnet",
+                          penalty = tune(), # let's tune the lambda penalty term
+                          mixture = 1) # mixture = 1 specifies pure LASSO
+
+lasso_wflow <- workflow() |>
+  add_model(lasso_model) |>
+  add_recipe(ridge_recipe) # same recipe is needed, no need to reinvent the wheel
+```
+
+We do need to re-tune the model:
+
+```{r tune model kfold lasso}
+lasso_tune1 <- tune_grid(lasso_model, 
+                      ridge_recipe, 
+                      resamples = batting_cv, 
+                      grid = grid_regular(penalty(range = c(-5, 2)), levels = 50))
+```
+
+Notice that we keep getting this weird message. We get this message any time *ALL* of the coefficients are shrunk to exactly 0. Remember that ridge regression is *not* supposed to do this, but LASSO will with sufficiently high penalty. (It turns out that you still *can* get this message with high enough penalty using ridge regression.)
+
+```{r tune model kfold lasso 2}
+lasso_tune1 |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  ggplot(mapping = aes(x = penalty, y = mean)) + geom_point() + geom_line() +
+  scale_x_log10()
+```
+
+```{r select best lasso}
+lasso_best <- lasso_tune1 |>
+  select_by_one_std_err(
+    metric = "rmse",
+    desc(penalty) # order penalty from largest (highest bias = simplest model) to smallest
+)
+lasso_best
+```
+
+Remember that the $\lambda$ values are not directly comparable between ridge regression and LASSO. Our much smaller penalty term does not mean that there is "less" shrinkage.
+
+Let's actually select the model and then do another calibration check:
+
+```{r lasso calibration check}
+lasso_wflow_final <- lasso_wflow |>
+  finalize_workflow(parameters = lasso_best) 
+
+lasso_pred_check <- lasso_wflow_final |>
+  fit_resamples(
+    resamples = batting_cv,
+    # save the cross-validated predictions
+    control = control_resamples(save_pred = TRUE)
+) |> 
+  collect_predictions()
+
+# using built-in defaults from probably
+cal_plot_regression(
+  lasso_pred_check,
+  truth = salary,
+  estimate = .pred
+)
+
+```
+
+Still looks like our calibration isn't great. But we press on...
+
+```{r fit lasso-tidy model}
+lasso_fit <- lasso_wflow_final |>
+  fit(data = batting_train)
+lasso_fit
+```
+
+We see the same thing where our tuning is completely irrelevant to the fitting.
+
+```{r look at lasso path}
+lasso_fit |>
+  extract_fit_engine() |>
+  plot(xvar = "lambda", label = TRUE)
+```
+
+We do see a different path here: for the most part, coefficients get shrunk to 0 and then stay there. I honestly am not sure what's going on with RBI, its coefficient gets shrunk to 0 and then it pops back in the model; I suspect it has something to do with the coefficient for H getting shrunk to 0.
+
+```{r get coefficient estimates lasso}
+lasso_coef <- lasso_fit |>
+  broom::tidy()
+lasso_coef 
+```
+
+Notice that LASSO does automatic variable selection: the slopes for G, R, H, X2B, X3B, SB, CS, SO, HBP, SH, SF, and lgID_NL have all been set to exactly 0, meaning that those predictors (or for the categorical variable, the "lgID" predictor) are no longer in the final model.
+
+```{r augment lasso fit}
+predictions_lasso <- lasso_fit |>
+  broom::augment(new_data = batting_test)
+predictions_lasso |>
+  dplyr::select(
+    nameFirst, 
+    nameLast, 
+    salary, 
+    .pred
+)
+rmse(predictions_lasso, truth = salary, estimate = .pred)
+```
+
+## Elastic Net with tidymodels
+
+Elastic net minimizes:
+
+$$
+RSS + \lambda \sum_{j=1}^p \left((1 - \alpha)  \beta_j^2 + \alpha |\beta_j| \right)
+$$
+
+The idea here is that our penalty term is now a (weighted) linear combination of the ridge and LASSO penalties. The tidymodels packages refer to $\alpha$ as the `mixture`, and it's also something we can tune:
+
+```{r elnet}
+elnet_model <- linear_reg(mode = "regression", engine = "glmnet",
+                          penalty = tune(), # let's tune the lambda penalty term
+                          mixture = tune())
+
+elnet_wflow <- workflow() |>
+  add_model(elnet_model) |>
+  add_recipe(ridge_recipe) # same recipe is needed, no need to reinvent the wheel
+```
+
+We do need to re-tune the model. Very annoyingly, when we set up our own grid, we *should* set a wide range of penalty values to account for both ridge and LASSO penalties:
+
+```{r tune model kfold elnet}
+elnet_grid <- expand.grid(penalty = 10^seq(-3, 2, by = 0.5),
+                          mixture = seq(0, 1, by = 0.25))
+elnet_tune1 <- tune_grid(elnet_model, 
+                      ridge_recipe, 
+                      resamples = batting_cv, 
+                      grid = elnet_grid)
+```
+
+```{r tune model kfold elnet 2}
+elnet_tune1 |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  mutate(mixture = as.factor(mixture)) |> 
+  ggplot(mapping = aes(x = penalty, y = mean, color = mixture)) + geom_point() + geom_line() +
+  scale_x_log10()
+```
+
+This suggests anything with a penalty around $\lambda = 0.01$ to $\lambda = 0.1$ would work decently well, regardless of whether we use ridge regression (`mixture = 0`), LASSO (`mixture = 1`), or a mix of the two.
+
+When we select our best model using the one standard error rule, we have to be very careful:
+
+```{r select elnet best model}
+best_elnet1 <- select_by_one_std_err(
+     elnet_tune1,
+     metric = "rmse",
+     desc(penalty), desc(mixture) # first order by lambda, then alpha
+)
+
+best_elnet2 <- select_by_one_std_err(
+     elnet_tune1,
+     metric = "rmse",
+     desc(mixture), desc(penalty) # first order by alpha, then lambda
+)
+
+best_elnet3 <- select_by_one_std_err(
+     elnet_tune1,
+     metric = "rmse",
+     desc(penalty) # first order by lambda, then implicitly ascending by alpha
+)
+
+best_elnet4 <- select_by_one_std_err(
+     elnet_tune1,
+     metric = "rmse",
+     desc(mixture) # first order by alpha, then implicitly ascending by lambda
+)
+
+bind_rows(best_elnet1, best_elnet2, best_elnet3, best_elnet4) # different models selected!
+```
+
+Notice that we get different choices of roughly-equivalent "best" models depending on which way we sort on our two parameters. We should not sort based on lambda first, because lambda for ridge regression and lambda for LASSO can be on completely different scales. But if we sort based on alpha first, then we're implicitly favoring either ridge (alpha = 0) or LASSO (alpha = 1). My preference is for higher LASSO proportions with higher penalties, as that is guaranteed to result in simpler models (fewer predictors end up in the model), but I'm not 100% sure that's a universally correct preference.
+
+So I'll select the second option as my "best" model.
+
+```{r fit elnet-tidy model}
+elnet_wflow_final <- finalize_workflow(elnet_wflow, parameters = best_elnet2) 
+
+elnet_fit <- fit(elnet_wflow_final, data = batting_train)
+elnet_fit
+```
+
+```{r look at elnet path}
+extract_fit_engine(elnet_fit) |>
+  plot(xvar = "lambda", label = TRUE)
+```
+
+```{r get coefficient estimates elnet}
+elnet_coef <- elnet_fit |>
+  broom::tidy()
+elnet_coef 
+```
+
+As expected, we do get some variable selection. Let's check model calibration:
+
+```{r elnet plot check}
+elnet_pred_check <- elnet_wflow_final |>
+  fit_resamples(
+    resamples = batting_cv,
+    # save the cross-validated predictions
+    control = control_resamples(save_pred = TRUE)
+) |> 
+  collect_predictions()
+
+# using built-in defaults from probably
+cal_plot_regression(
+  elnet_pred_check,
+  truth = salary,
+  estimate = .pred
+)
+```
+
+Seems no worse than anything else we've come up with.
+
+```{r augment elnet fit}
+predictions_elnet <- broom::augment(elnet_fit, new_data = batting_test)
+predictions_elnet |> dplyr::select(
+  nameFirst, nameLast, salary, .pred
+)
+rmse(predictions_elnet, truth = salary, estimate = .pred)
+```
+
+We're getting a slightly higher RMSE on our validation set than from our cross-validation estimate; that's not unusual.
+
+## Logistic Regression with Penalized Regression
+
+Let's use the elastic net to do logistic regression and predict our fruits/vegetables.
+
+```{r elnet}
+elnet_logistic <- logistic_reg(mode = "classification",
+                               engine = "glmnet",
+                               penalty = tune(),
+                               mixture = tune())
+# Here we tune to see if we want pure ridge, pure LASSO, or a mix
+
+logr_recipe <- recipe(
+  SubCategory ~ Taste + Cravings + Healthiness, # response ~ predictors
+  data = fv_train_tidy
+) |>
+  # We do want to normalize here - it's a penalized regression model!
+  step_normalize(all_numeric_predictors())
+
+logr_wflow <- workflow() |>
+  add_model(elnet_logistic) |>
+  add_recipe(logr_recipe) 
+```
+
+Now we tune the model, using a wide range of penalties as usual. We can always re-tune using a narrower grid if necessary:
+
+```{r tune logistic elnet}
+set.seed(1257)
+fv_cv <- vfold_cv(fv_train_tidy, v = 10)
+
+logr_grid <- expand.grid(penalty = 10^seq(-3, 2, by = 0.5),
+                          mixture = seq(0, 1, by = 0.25))
+logr_tune <- tune_grid(elnet_logistic, 
+                      logr_recipe, 
+                      resamples = fv_cv,
+                      metrics = metric_set(
+                        roc_auc,
+                        brier_class,
+                        mn_log_loss
+                      ),
+                      grid = logr_grid)
+
+autoplot(logr_tune)
+```
+
+This is pretty clear: high amounts of regularization are awful, and ridge regression is generally doing a better job than anything else at those high values. This is perhaps not surprising with a small number of predictors.
+
+Since ridge regression is the best option over the entire range of penalties, let's sort *ascending* by alpha and then descending by lambda, to find the largest penalty we can use with ridge regression and still be okay.
+
+```{r select elnet best logistic}
+best_logistic <- select_by_one_std_err(
+     logr_tune,
+     metric = "mn_log_loss",
+     mixture, desc(penalty) 
+)
+
+best_logistic
+```
+
+
+```{r fit elnet-logistic model}
+elnet_logr_final <- finalize_workflow(logr_wflow, parameters = best_logistic) 
+
+elnet_logr_fit <- fit(elnet_logr_final, data = fv_train_tidy)
+elnet_logr_fit
+```
+
+```{r look at elnet path logistic}
+extract_fit_engine(elnet_logr_fit) |>
+  plot(xvar = "lambda", label = TRUE)
+```
+
+Notice that here 1 is for Taste, 2 is for Cravings, and 3 is for Healthiness.
+
+```{r get coefficient estimates elnet logistic}
+elnet_logr_coef <- elnet_logr_fit |>
+  broom::tidy()
+elnet_logr_coef 
+```
+
+Remember that these coefficients represents an increase in log-odds of being a Vegetable associated with a 1 standard deviation increase (not a 1-point increase!) in the predictor.
+
+Let's check model calibration:
+
+```{r elnet logr plot check}
+elnet_logr_pred_check <- elnet_logr_final |>
+  fit_resamples(
+    resamples = fv_cv,
+    # save the cross-validated predictions
+    control = control_resamples(save_pred = TRUE)
+) 
+
+elnet_logr_preds <- elnet_logr_pred_check |> 
+  collect_predictions()
+
+# using built-in defaults from probably
+cal_plot_windowed(
+  elnet_logr_preds,
+  truth = SubCategory,
+  estimate = .pred_Vegetables,
+  event_level = "second"
+)
+```
+
+It's perhaps a bit concerning that all of our predictions are betwen about 40% and 85%
+
+```{r post-process knn predictions class}
+library(betacal)
+elnet_logr_pred_check |>
+  cal_validate_beta(
+    metrics = metric_set(brier_class, mn_log_loss),
+    save_pred = TRUE) |> # nonlinear smoothing, use smooth = FALSE for linear transformation
+  collect_predictions() |>
+  cal_plot_windowed(
+    truth = SubCategory,
+    estimate = .pred_Vegetables, # give it a probability column
+    event_level = "second" # and tell it which row/column of the confusion matrix it corresponds to
+  )
+
+```
+
+Here we can see that our predictions have become more extreme - from roughly 20% to 95% - after beta calibration.
+
+```{r augment elnet fit logistic}
+# Store the calibration for use 
+calibrator <- cal_estimate_beta(
+  elnet_logr_pred_check
+)
+
+predictions_orig_logr <- broom::augment(elnet_logr_fit, 
+                                   new_data = fv_valid_tidy) 
+
+predictions_calibrated <- predictions_orig_logr |>
+  cal_apply(calibrator)
+
+predictions_orig_logr
+predictions_calibrated
+```
+
+Notice that the class probabilities change after calibration such that the predicted class *may not* match the prediction - here, using a threshold of 0.5, Red Grapes and Strawberries would be classified as Fruits using the calibrated probabilities!

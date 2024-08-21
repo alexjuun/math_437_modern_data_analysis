@@ -1,0 +1,268 @@
+---
+title: 'Randomization-Based Tests for Comparing Two Means'
+author: "Math 437"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages used in the analysis}
+library(rsample) # permutation testing with tidymodels
+library(purrr)
+library(dplyr)
+library(coin) # "traditional" nonparametric test
+```
+
+## General Concept of Conditional Inference
+
+Suppose that we have response variable $Y$ and explanatory variable(s) $X$ measured in the same sample of size $N$. We wish to test the null hypothesis
+
+$$
+H_0: F(Y|X) = F(Y)
+$$
+
+That is, the distribution of $Y$ does not depend on the realized value of $X$.
+
+The **conditional** part of conditional inference comes from **fixing** $X$ at the observed values and conditioning on *all possible* permutations of the observed $Y$. This is doable because under $H_0$, the values $y_1, \ldots, y_N$ are **exchangeable** (the joint distribution is invariant to change of indices).
+
+### Intuition Behind Conditional Inference
+
+Suppose that Math 437 gets really popular and there are two sections, one taught by Dr. Wynne and one taught by Dr. Behseta.
+
+The null hypothesis $F(\text{score}|\text{instructor}) = F(\text{score})$ implies that your grade would be the same *even if you switched instructors*. Therefore, if the null hypothesis is true, we can randomly swap some students between the two classes and get a distribution of grades in the two sections that is "just as likely" to have occurred as the distribution that we actually observed. By repeatedly doing this, we can build up a null distribution of a test statistic *without* making any assumptions about the underlying population distribution of grades.
+
+## General Permutation Test Framework
+
+Let $X$ be an explanatory variable and $Y$ be a response variable. It doesn't really matter the types; this framework will work whether $X$ and $Y$ are both categorical or both numerical or one of each. We fix the values of the explanatory variable and randomly permute (rearrange) the response values. We then compute the value of a test statistic $T$ for the permuted sample.
+
+When the sample size is small, we repeat this for *every* possible permutation (including the observed one) and construct the exact sampling distribution of $T$. When the sample size is large, we repeat this for a large number $B$ of the possible permutations and approximate the sampling distribution of $T$.
+
+### Pseudocode for Permutation Testing
+
+We will follow the "Math 120" framework for obtaining a p-value for a NHST or Fisher-framework test.
+
+- Step 1S: Identify a test **statistic** and compute its value from the observed data
+
+- Step 2S: Estimate the **sampling distribution** of the 1S statistic under the null hypothesis
+
+- Step 3S: Compare the 1S and 2S outputs to estimate the **strength** of evidence against $H_0$/in favor of $H_a$ (the p-value)
+
+## Code Your Own Permutation-Based t-test
+
+We'll use some data from the `wilcox.test` documentation. In this dataset, placenta samples were taken 5 minutes after delivery from 5 women whose pregnancies were terminated between 12 and 26 weeks and 10 control women who gave natural birth. The response variable of interest is the permeability constant of a placental membrane.
+
+```{r data two-sample}
+# Example from ?wilcox.test
+placenta <- data.frame(
+    group = c(rep("natural", 10), rep("terminated", 5))
+  , permeability = c(0.80, 0.83, 1.89, 1.04, 1.45, 1.38, 1.91, 1.64, 0.73, 1.46, 1.15, 0.88, 0.90, 0.74, 1.21)
+)
+```
+
+### Step 1S
+
+We start by computing the value of the t-statistic under the null hypothesis $H_0: \mu_{natural} - \mu_{terminated} = 0$. 
+
+The assumption of *exchangeability under the null hypothesis* implies that under the null hypothesis, the two groups come from distributions that have the same location (e.g., mean), same scale (e.g., standard deviation), and same shape. Since we assume that the two groups have the same population standard deviation, we should compute our t-statistic using the *pooled* standard error.
+
+```{r observed t-stat}
+t.obs <- t.test(permeability ~ group, 
+                data = placenta, 
+                var.equal = TRUE)$statistic  # observed t-statistic
+```
+
+### Step 2S
+
+The key to a permutation-based t-test is to not assume that the t-statistic has a t-distribution with $n_1 + n_2 - 2$ degrees of freedom, but rather to approximate the "true" sampling distribution of the t-statistic and compute the p-value directly from that histogram.
+
+Under the null hypothesis, each placenta would have the same permeability if it were in the other group. Therefore, to simulate a new sample under $H_0$, we can randomly reshuffle which group each placenta is in. Let's see what this looks like:
+
+```{r permute response variable once}
+  # initialize the vector of resampled t-statistics
+  print(placenta)  
+
+  # Set up data frame to resample from
+  resampled_placenta <- placenta
+
+  set.seed(102) # reproducibility
+    # Randomly reorder permeability by
+    # Sampling without replacement from the response variable
+  resampled_placenta$permeability <- sample(placenta$permeability)
+
+  print(resampled_placenta)
+```
+
+Once we have permuted the response variable, we compute the t-statistic using the permuted response values. We need to repeat this a bunch of times to get the approximate null distribution of the t-statistic.
+
+```{r permute response variable}
+  # initialize the vector of resampled t-statistics
+  B <- 999 # usually 10^b - 1 so we have 10^b total t-statistics
+  t.star <- numeric(B)  # B 0's
+  
+  # Set up data frame to resample from
+  resampled_placenta <- placenta
+
+  set.seed(102) # reproducibility
+  for (i in 1:B){
+    
+    # Randomly reorder permeability by
+    # Sampling without replacement from the response variable
+    resampled_placenta$permeability <- sample(placenta$permeability)
+    
+    # get the new t-statistic
+    t.star[i] <- t.test(permeability ~ group,
+                        data = resampled_placenta,
+                        var.equal = TRUE)$statistic  
+    }
+```
+
+With these small sample sizes, it is reasonable to obtain all 3003 possible permutations of group assignments and compute a t-statistic for each one. But typically, we have larger sample sizes and getting all possible permutations will take forever. 
+
+```{r get sampling distribution}
+t.all <- c(t.obs, t.star) 
+hist(t.all)
+abline(v = t.obs, col = "red")
+```
+
+Above is the permutation null distribution of the t-statistics.
+
+To compute the p-value corresponding to a one-sided $H_a$, we find the proportion of t-statistics in the estimated sampling distribution (above) that are "as or more extreme" compared to what we observed. Note that our original statistic value is *guaranteed* to be part of the estimated sampling distribution, so we should never get an estimated p-value of exactly 0.
+
+```{r compute p-values}
+p.left <- mean(t.all <= t.obs)
+p.right <- mean(t.all >= t.obs)
+p.two.sided <- 2*min(p.left, p.right)
+
+print(c("p.left" = p.left, 
+        "p.right" = p.right, 
+        "p.two.sided" = p.two.sided)
+)
+
+# compare to two-sided p-value with t-test
+2*pt(t.obs, df = nrow(placenta) - 2, lower.tail = FALSE)
+```
+
+## Permutation-Based t-test with `tidymodels`
+
+### Write a Function to Return the Test Statistic
+
+Just like when we did bootstrap, our function should take one input, `split`, which in this case contains the information about the permutation resample. We will output the t-statistic.
+
+```{r return t-statistic tidymodels}
+placenta_t <- function(split){
+  
+  resample <- analysis(split)
+  
+  resample_t <- t.test(permeability ~ group, data = resample, var.equal = TRUE)$statistic
+  
+  return(resample_t)
+}
+```
+
+### Set Up the Resamples
+
+```{r set up permutations}
+set.seed(15698)
+placenta_permuted <- permutations(placenta, 
+                                  permute = permeability,
+                                  times = 999,
+                                  apparent = TRUE)
+```
+
+The first argument to `permutations` is the data frame. The second argument (`permute`) is the variable(s) to shuffle; for the types of inference we are doing here, shuffling only the response variable will work. The third argument (`times`) is the number of times to reshuffle (again, usually 1 less than a power or 10), and the fourth argument (`apparent=TRUE`) indicates that an "extra resample" equal to the original data is obtained.
+
+### Obtain the Sampling Distribution
+
+Here we can apply our function to every resample, thus completing the 1S and 2S steps at the same time.
+
+We will use the `map` function from `purrr` again to apply our function to every split; however, this time, since our output is a single number, we will use `map_dbl`, which specifies that we want our numbers in a single vector rather than a list.
+
+```{r get t dist tidy}
+t_tidy <- map_dbl(
+  placenta_permuted$splits,
+  placenta_t
+)
+```
+
+```{r get sampling distribution tidy}
+hist(t_tidy)
+# the last split is the original split
+t_obs <- t_tidy[1000]
+abline(v = t_obs, col = "red")
+```
+
+### Get the p-value
+
+Once we obtain our sampling distribution of t-statistics, we get the p-value the exact same way:
+
+```{r compute p-values}
+
+p_left_tidy <- mean(t_tidy <= t_obs)
+p_right_tidy <- mean(t_tidy >= t_obs)
+p_two_sided_tidy <- 2*min(p_left_tidy, p_right_tidy)
+
+print(c("p_left" = p_left_tidy, 
+        "p_right" = p_right_tidy, 
+        "p_two_sided" = p_two_sided_tidy)
+)
+
+```
+
+## Rank-Based Permutation Test: Mann-Whitney U
+
+Suppose we measure a continuous variable $y$ in two different populations. We obtain sample values $y_{11}, y_{12}, \ldots, y_{1m}$ from $F_1$ and $y_{21}, y_{22}, \ldots, y_{2n}$ from $F_2$. We assume that $F_2(x) = F_1(x - \Delta)$ (basically think of this as meaning "everyone's exam score would go up by $\Delta$ points if you had a better teacher"). Our null hypothesis is $H_0: \Delta = 0$.
+
+The Mann-Whitney U Test defines the test statistic as $U = \sum_{i=1}^m \phi_i$, where $\phi_i$ is the number of observations from group 2 ($y_{21}, y_{22}, \ldots, y_{2n}$) that are larger than $y_{1i}$. Generally, the best way of thinking about this statistics is to order *all* of the observations from smallest to largest (as if you were computing an overall median), then write the group numbers below it, then for each "1" count how many "2's" have bigger response values. 
+
+Under $H_0$, $U$ has an approximately normal distribution with mean $\frac{mn}{2}$ and variance $\frac{mn(m+n+1)}{12}$.
+
+R makes an absolute hash of this test. First, R instead defines the statistic $W = \sum_{j=1}^n \phi_j$, where $\phi_j$ is the number of observations from group 1 ($y_{11}, y_{12}, \ldots, y_{1m}$) that are larger than $y_{2j}$. This is generally not a problem with computing p-values as the distribution of $U$ is symmetric about $\mu = \frac{mn}{2}$, thus $P(U \leq u) = P(W \geq w)$; it just makes interpreting the output confusing. Second, $W$ is traditionally used for a different test statistic, $\sum_{j=1}^n S_j$ where $S_j$ is the rank of $y_{2j}$ when all $m+n$ observations are ordered from smallest to largest (using this test statistic instead is called the *Wilcoxon Rank-Sum Test*). Again, this does not really affect p-values, it just makes interpreting the output confusing. Third, R will by default assume that the test statistic has a normal distribution, even at small sample sizes where this approximation is no good. This does affect p-values.
+
+### Doing the Test in R
+
+The best way I have found to do the test is in the `coin` ("**co**nditional **in**ference) package:
+
+```{r wilcox test gives error, eval=FALSE}
+wilcox_test(permeability ~ group, data = placenta, alternative = "greater", distribution = "exact")
+```
+
+This gives an error because `wilcox_test` *requires* the grouping variable to be a factor variable. We can fix that easily:
+
+```{r wilcox test gives output}
+placenta <- placenta |>
+  mutate(group = factor(group, levels = c("natural", "terminated")))
+
+wilcox_test(permeability ~ group, data = placenta, 
+            alternative = "greater", 
+            distribution = "exact")
+```
+
+Notice that the output gives a test statistic `Z`, the z-score corresponding to the test statistic. To get out the original test statistic, use:
+
+```{r original test stat MW}
+wilcox_test(permeability ~ group, data = placenta, 
+            alternative = "greater", 
+            distribution = "exact") |>
+  statistic("linear")
+```
+
+Note that this is the Wilcoxon Rank-Sum Statistic with ranks summed for group `natural`.
+
+### Why Use Rank-Based Permutation Tests?
+
+Notice that we got a one-sided p-value approximately twice as big as the one-sided p-value for the permutation-based t-test. The reason for this is that the test statistics measure slightly different things. The permutation t-test works by permuting the actual *data values*, so when we swap two response values, it matters how different (in absolute value) those values are. In contrast, the Mann-Whitney test works by permuting the *ranks*, so the absolute difference between the values doesn't matter, only how many other observations are between the swapped values. 
+
+Typically, the Mann-Whitney test statistic works better when you have outliers that can produce funny-looking permutation null distributions fot things like t-statistics. The Mann-Whitney test also works when your data is already is rank format (and you don't have access to the "raw data" from which those ranks were derived).
+
+## Beyond Two Means
+
+Any time we are testing a null hypothesis of independence, and can assume exchangeability under the null hypothesis, we can perform a permutation-based test in the conditional inference framework. This includes:
+
+-   Testing the equivalence of multiple means in ANOVA
+
+-   Testing the equivalence of distributions between groups in a $\chi^2$ test of independence
+
+-   Testing the independence of the response variable and the (set of) predictor variable(s) in a simple or multiple linear regression model

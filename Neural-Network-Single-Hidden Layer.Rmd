@@ -1,0 +1,294 @@
+---
+title: 'Single Hidden Layer Neural Networks Example Code and Class Activities'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data
+
+For regression, we'll continue to use our Lahman baseball salary data. For classification, we'll continue to use the `Restrain` data and predict fruits/vegetables. 
+
+```{r create batting-2016 data, warning = FALSE, message = FALSE}
+library(Lahman)
+library(tidyverse)
+library(tidymodels)
+library(keras)
+
+
+salaries <- Salaries %>%
+  dplyr::select(playerID, yearID, teamID, salary)
+peopleInfo <- People %>%
+  dplyr::select(playerID, birthYear, birthMonth, nameLast,
+         nameFirst, bats)
+batting <- battingStats() %>% 
+  left_join(salaries, 
+            by =c("playerID", "yearID", "teamID")) %>%
+  left_join(peopleInfo, by = "playerID") %>%
+  mutate(age = yearID - birthYear - 
+           1L *(birthMonth >= 10)) %>%
+  arrange(playerID, yearID, stint)
+
+batting_2016 <- batting %>% filter(yearID == 2016,
+                                   !is.na(salary),
+                                   G >= 100, AB >= 200
+                                   ) %>%
+  mutate(salary = log10(salary), # there's a reason for this, I promise
+         lgID = factor(lgID, levels = c("AL", "NL"))) # fix the defunct league issue
+
+set.seed(11249)
+batting_2016_split <- initial_split(batting_2016, prop = 0.75)
+batting_train <- training(batting_2016_split)
+batting_test <- testing(batting_2016_split)
+```
+
+```{r import Restrain data}
+Restrain <- readr::read_csv("Restrain.csv")
+fv <- Restrain %>% filter(SubCategory %in% c("Fruits", "Vegetables"))
+fv$SubCategory <- factor(fv$SubCategory, levels = c("Fruits","Vegetables"))
+set.seed(1880)
+fv_split <- initial_split(fv, prop = 0.80) 
+
+fv_train_tidy <- training(fv_split)
+fv_test_tidy <- testing(fv_split)
+```
+
+## Single Hidden Layer Neural Networks
+
+Our conservative "simpler models are better" viewpoint suggests that if you can solve a problem with only one hidden layer, you should use only one hidden layer. 
+
+The tidymodels neural network options that use `keras` only allow one hidden layer. For more complicated problems that require complicated architecture, using `keras` directly (either the Python library or the R package that calls the Python code) is the vastly preferred option.
+
+### Parameters To Tune
+
+There are five parameters that we can tune. Three of these parameters specifically set up the model:
+
+* `hidden_units` indicates the number of "neurons" in the hidden layer
+* `epochs` indicates the number of training iterations (this is essentially equivalent to `trees` in the boosted tree model)
+* `activation` indicates the type of activation function for the units in the hidden layer. The default is "softmax" (if you have an updated package it may be a bit smarter and use "linear" for regression problems), but the "relu" option ($max(0, x)$) is a popular alternative.
+
+The other two parameters define the type of regularization used. It is typically recommended to use/tune only one of these parameters:
+
+* `penalty` (for standard ridge-type regularization, which will shrink coefficients toward 0 but not set any of them to exactly 0)
+* `dropout` (for subset selection-type "dropout regularization", which will set `dropout` proportion of activations to exactly 0)
+
+## Preprocessing the Data
+
+Neural networks work best when all predictors have distributions as close to $N(0, 1)$ as possible. This means that:
+
+* All nominal predictors should be replaced with indicator variables
+* All quantitative predictors should be transformed to something closer to a normal distribution
+* All quantitative predictors should be centered and scaled (i.e., converted to z-scores)
+
+We know how to do the first and third of these steps with `step_dummy` and `step_normalize`. The second of these steps can be accomplished through a variety of standard transformations (log, square root, etc.), but there are two additional transformations that are extremely common:
+
+### Box-Cox Transformation
+
+$$
+T(x) = 
+\begin{cases}
+\frac{x^\lambda - 1}{\lambda}, \lambda \neq 0 \\
+log(x), \lambda = 0 \\
+\end{cases}
+$$
+
+where $\lambda$ is typically chosen such that correlation on the normal q-q plot of $T(x)$ is maximized.
+
+Notice that the Box-Cox transformation includes the following special cases:
+
+$$
+T(x) =
+\begin{cases}
+log(x), \lambda = 0 \\
+x - 1, \lambda = 1 \\
+2 \sqrt{x} - 2, \lambda = \frac{1}{2}\\
+1 - \frac{1}{x}, \lambda = -1
+\end{cases}
+$$
+
+i.e., to within a shift/scale the Box-Cox transformation can do log-transformation, square root-transformation, inverse (reciprocal) transformation, or no transformation at all!
+
+### Yeo-Johnson Transformation
+
+The Box-Cox transformation is only useful for strictly positive variables. When $x$ can contain non-positive values, you can get weird behavior and/or NaNs (e.g., we can't take square roots of negative numbers).
+
+Yeo and Johnson (2000) proposed a different power transform that works similarly to Box-Cox but doesn't do weird things with negative numbers:
+
+$$
+T(x) = 
+\begin{cases}
+\frac{(x+1)^\lambda - 1}{\lambda}, \lambda \neq 0, x \geq 0 \\
+log(x + 1), \lambda = 0, x \geq 0 \\
+-\frac{\left((-(x+1)^{2 - \lambda}) - 1\right)}{2 - \lambda}, \lambda \neq 2, x < 0\\
+-log(-x + 1), \lambda = 2, x < 0
+\end{cases}
+$$
+
+where again $\lambda$ is typically chosen such that the correlation on the normal q-q plot of $T(x)$ is maximized.
+
+The `step_BoxCox` and `step_YeoJohnson` functions in the `recipes` package will take care of the appropriate transformations.
+
+## Neural Network for Regression
+
+```{r nnR-tidy model}
+neuralnetR_model <- mlp(mode = "regression", engine = "keras",
+                        hidden_units = tune(),
+                        penalty = tune(),
+                        epochs = 25,
+                        activation = "relu") |>
+  set_args(seeds = c(1, 2, 3)) # we need to set 3 seeds 
+# Honestly I'm not even sure if Python uses these seeds or just makes up its own ones
+
+# realistically we will more than 25 epochs to get a good model
+# I just want to show you how it works without it taking forever to fit
+
+neuralnetR_recipe <- recipe(
+  salary ~ G +  R + H + X2B + X3B + HR + RBI + 
+                   SB + CS + BB + SO + IBB + HBP + SH + SF + GIDP + 
+                   age + lgID, # response ~ predictors
+  data = batting_train
+) |>
+  step_YeoJohnson(all_numeric_predictors()) |> 
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors())
+# Here we use step_YeoJohnson because we did EDA and know some of the predictor values = 0
+
+neuralnetR_wflow <- workflow() |>
+  add_model(neuralnetR_model) |>
+  add_recipe(neuralnetR_recipe)
+```
+
+If we don't know what grid we should be searching over, there's a nice way for us to see the defaults:
+
+```{r check defaults}
+extract_parameter_set_dials(neuralnetR_model) |>
+  pull("object")
+```
+total = k*number of possibile combination of tuning over
+1. We can use `grid_regular` without a `range` argument for each parameter. If we don't specify a `range` argument for `hidden_units`, what range will it search over? What about for `penalty`?
+
+```{r tune nnR}
+# Again - let's not take forever
+set.seed(1332)
+batting_kfold <- vfold_cv(batting_train, v = 5, repeats = 1) 
+
+neuralnetR_tune <- tune_grid(neuralnetR_model, 
+                      neuralnetR_recipe, 
+                      resamples = batting_kfold, 
+                      metrics = metric_set(rmse),
+                      grid = grid_regular(hidden_units(range = c(16, 32)),
+                                          penalty(),
+                                          levels = 2)
+)
+```
+
+2. Briefly explain what is going on in the `Viewer` pane in RStudio.
+
+3. How many of these graphs in the `Viewer` pane are going to be generated during the cross-validation?
+20
+```{r select best nnR}
+collect_metrics(neuralnetR_tune)
+
+neuralnetR_best <- select_by_one_std_err(
+  neuralnetR_tune,
+  metric = "rmse",
+  hidden_units, desc(penalty)
+)
+
+neuralnetR_wflow_final <- finalize_workflow(neuralnetR_wflow, 
+                                            parameters = neuralnetR_best) 
+```
+
+```{r fit nnR}
+neuralnetR_fit <- fit(neuralnetR_wflow_final, data = batting_train)
+neuralnetR_fit
+```
+
+4. Somewhere other in this activity, sketch a diagram of the model that we are fitting.
+
+```{r augment neuralnetR fit}
+predictions_neuralnetR <- broom::augment(neuralnetR_fit, new_data = batting_test)
+predictions_neuralnetR |> dplyr::select(
+  nameFirst, nameLast, salary, .pred
+)
+rmse(predictions_neuralnetR, truth = salary, estimate = .pred)
+```
+
+Notice that this is an absolutely *terrible* RMSE compared to what we've gotten with other optimized regression models (we've been consistently between 0.4 and 0.5 with just about every other model we've explored). Neural networks can be extremely fiddly to tune, and you often have to worry about overfitting as you mess with the tuning parameters.
+
+## Neural Network for Classification
+
+```{r nnnC}
+neuralnetC_model <- mlp(mode = "classification", engine = "keras",
+                        hidden_units = tune(),
+                        dropout = tune(),
+                        epochs = 25,
+                        activation = "relu") |>
+  set_args(seeds = c(1, 2, 3)) # we need to set 3 seeds 
+# let's tune the dropout parameter instead
+
+neuralnetC_recipe <- recipe(
+  SubCategory ~ Taste + Healthiness + Cravings,
+  data = fv_train_tidy
+) |>
+  step_YeoJohnson(all_numeric_predictors()) |> 
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors())
+# no nominal predictors here so won't do anything
+
+neuralnetC_wflow <- workflow() |>
+  add_model(neuralnetC_model) |>
+  add_recipe(neuralnetC_recipe)
+```
+
+```{r check defaults nnC}
+extract_parameter_set_dials(neuralnetC_model) |>
+  pull("object")
+```
+
+```{r tune parameters nnC}
+set.seed(1332)
+fv_kfold <- vfold_cv(fv_train_tidy, v = 5, repeats = 1) 
+
+
+neuralnetC_tune <- tune_grid(neuralnetC_model, 
+                      neuralnetC_recipe, 
+                      resamples = fv_kfold, 
+                      metrics = metric_set(mn_log_loss),
+                      grid = grid_regular(hidden_units(range = c(16, 32)),
+                                          dropout(range = c(0, 0.1)),
+                                          levels = 2)
+)
+```
+
+
+```{r select best nnC}
+collect_metrics(neuralnetC_tune)
+
+neuralnetC_best <- select_by_one_std_err(
+  neuralnetC_tune,
+  metric = "mn_log_loss",
+  hidden_units, desc(dropout)
+)
+neuralnetC_best
+
+neuralnetC_wflow_final <- finalize_workflow(neuralnetC_wflow, 
+                                            parameters = neuralnetC_best) 
+
+```
+
+```{r fit nnC}
+neuralnetC_fit <- fit(neuralnetC_wflow_final, data = fv_train_tidy)
+neuralnetC_fit
+```
+
+```{r augment neuralnetC fit}
+predictions_neuralnetC <- broom::augment(neuralnetC_fit, new_data = fv_test_tidy)
+predictions_neuralnetC |> dplyr::select(
+  Food, SubCategory, .pred_class, .pred_Fruits
+)
+mn_log_loss(predictions_neuralnetC, truth = SubCategory, .pred_Fruits, 
+            event_level = "first")
+```

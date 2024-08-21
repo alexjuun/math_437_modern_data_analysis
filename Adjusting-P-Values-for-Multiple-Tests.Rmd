@@ -1,0 +1,352 @@
+---
+title: "Adjustments for Testing Multiple Hypotheses"
+author: "Math 437"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## The Problem of Testing Multiple Hypotheses
+
+Suppose that we are testing two candidate genes, A and B, for possible associations with some numerical response variable Y. In reality neither A nor B have anything to do with Y, so $H_0: \mu_{dom} = \mu_{rec}$ is true whether "dominant" and "recessive" phenotypes refer to gene A or gene B. Let's assume we have 100 subjects - 75 have dominant phenotype and 25 have recessive phenotype.
+
+```{r Simulation 1 - data}
+set.seed(12345)
+simulation1.df <- data.frame(
+  Y = rnorm(100, mean = 0, sd = 1),
+  # randomly pick which ones have dominant vs recessive
+  phenA  = sample(c(rep("dom", 75), rep("rec", 25))),  
+  phenB  = sample(c(rep("dom", 75), rep("rec", 25)))
+  )
+
+t.test(Y ~ phenA, data = simulation1.df)$p.value
+t.test(Y ~ phenB, data = simulation1.df)$p.value
+```
+
+In this particular case we committed no Type I errors. But let's run this simulation 10,000 times and see what happens:
+
+```{r Simulation 1 - many times}
+pvalues1 <- matrix(0, nrow = 10000, ncol = 2)
+
+set.seed(12345)
+
+for (i in 1:nrow(pvalues1)){
+simulation1.df <- data.frame(
+  Y = rnorm(100, mean = 0, sd = 1),
+  # randomly pick which ones have dominant vs recessive
+  phenA  = sample(c(rep("dom", 75), rep("rec", 25))),  
+  phenB  = sample(c(rep("dom", 75), rep("rec", 25)))
+  )
+
+  pvalues1[i, 1] <- t.test(Y ~ phenA, data = simulation1.df)$p.value
+  pvalues1[i, 2] <- t.test(Y ~ phenB, data = simulation1.df)$p.value
+  
+}
+```
+
+We will commit a Type I Error if *either* of the p-values are below our significance level.
+
+```{r Simulation 1 unadjusted}
+min_pvalues1 <- apply(pvalues1, 1, min)
+# 1 means every row
+hist(min_pvalues1)
+mean(min_pvalues1 <= 0.05)
+```
+
+Notice that our Type I Error rate has jumped up to almost 10%. The theoretical rate is 9.75%, which matches our simulation fairly closely. As we include more and more candidate genes, that rate will be:
+
+$$
+1 - (1 - \alpha)^{m_0}
+$$
+
+where $\alpha$ is our significance level and $m_0$ is the number of candidate genes that are indpendent of $Y$. (Why?)
+
+As $m_0$ increases, we are *almost guaranteed* to commit a Type I Error somewhere in our suite of tests. We define the probability of committing *at least one* Type I Error on a set of hypothesis tests as the family-wise error rate (FWER).
+
+## Adjusting P-values to Hit a Given FWER
+
+Let's assume that all $m$ null hypotheses we test are true. Let $A_j$ be the event that the $j^{th}$ null hypothesis is rejected. We define the family-wise error rate $\alpha$ mathematically such that:
+
+$$
+P(\bigcup_{j=1}^m A_j) \leq \alpha_{FWER}
+$$
+
+### Bonferroni Method
+
+We may have learned in Math 335 that
+
+$$
+P(\bigcup_{j=1}^m A_j) \leq \sum_{j=1}^m P(A_j)
+$$
+
+The simplest adjustment method, then, sets $\sum_{j=1}^m P(A_j) = \alpha_{FWER}$. Letting $P(A_j) = \alpha_{single}$, we find that $\alpha_{single} = \frac{\alpha_{FWER}}{m}$. In other words, we reject an individual $H_0$ if the p-value $p \leq \frac{\alpha_{FWER}}{m}$. This method is called the **Bonferroni method**.
+
+Pseudocode for Bonferroni's method (traditional way):
+
+1. Define the desired FwER $\alpha_{FWER}$
+2. Compute the p-values $p_1, p_2, \ldots, p_m$ corresponding to $H_{01}, H_{02}, \ldots, H_{0m}$
+3. Reject all $H_0$ corresponding to p-values below the significance level $\frac{\alpha_{FWER}}{m}$
+
+The tricky part is that R knows the individual p-values and the number of tests but *not* the desired FWER. So rather than adjusting the significance level, R adjusts the p-values so that we reject any $H_0$ for which $mp \leq \alpha_{FWER}$.
+
+Pseudocode for Bonferroni method (R's way):
+
+1. Compute the p-values $p_1, p_2, \ldots, p_m$ corresponding to $H_{01}, H_{02}, \ldots, H_{0m}$
+2. Multiply all the p-values by $m$
+3. Reject all $H_0$ corresponding to p-values below the desired $\frac{\alpha_{FWER}}$
+
+The command to do the adjustment in Step 2 is `p.adjust`:
+
+```{r Simulation 1 - Bonferroni}
+pvalues1[1,] # First set of p-values
+
+p.adjust(pvalues1[1,], method = "bonferroni")
+```
+
+Note that since $0.603 * 2 > 1$, R reports the adjusted p-value for the first test as 1.
+
+Let's see how this affects the simulated FWER:
+
+```{r Simulation 1 adjusted BONF}
+adj_pvalues1 <- apply(pvalues1, 1, p.adjust, method = "bonferroni")
+# Weird quirk of apply is that the output is now 2 x 10000 instead of 10000 x 2
+min_adj_pvalues1 <- apply(adj_pvalues1, 2, min)
+hist(min_adj_pvalues1)
+mean(min_adj_pvalues1 <= 0.05)
+```
+
+Now the probability of rejecting *either* hypothesis has been reduced back to around the $\alpha_{single} = 0.05$ we were expecting.
+
+### Holm's Method
+
+Holm's Step-Down Procedure is almost always preferred over Bonferroni's method as it is uniformly more powerful (Bonferroni's method lets Type II Errors get out of control).
+
+Pseudocode for Holm's method (traditional way):
+
+1. Define the desired FWER $\alpha$
+2. Compute the p-values $p_1, p_2, \ldots, p_m$ corresponding to $H_{01}, H_{02}, \ldots, H_{0m}$
+3. Order the p-values from smallest to largest, $p_{(1)} \leq p_{(2)} \leq \ldots \leq p_{(m)}$
+4. Compare $p_{(1)}$ to significance level $\frac{\alpha_{FWER}}{m}$. If the corresponding $H_0$ is not rejected, STOP.
+5. Compare $p_{(2)}$ at significance level $\frac{\alpha_{FWER}}{m - 1}$. If the corresponding $H_0$ is not rejected, STOP.
+6. Continue comparing p-values $p_{(j)}$ to significance level $\frac{\alpha_{FWER}}{m + 1 - j}$ one at a time until we get a non-signficant one.
+7. Reject all $H_0$ you rejected before stopping.
+
+Again, in practice, R doesn't know the desired FWER, so we have to adjust the p-values instead.
+
+Pseudocode for Holm's method (R's way):
+
+1. Compute the p-values $p_1, p_2, \ldots, p_m$ corresponding to $H_{01}, H_{02}, \ldots, H_{0m}$
+2. Order the p-values from smallest to largest, $p_{(1)} \leq p_{(2)} \leq \ldots \leq p_{(m)}$
+3. Multiply each p-value $p_{(j)}$ by $m + 1 - j$
+4. If $p_{(j)} \leq p_{(k)}$ before the adjustment in Step 3 but $p_{(j)} > p_{(k)}$ after the adjustment, set the adjusted $p_{(k)}$ equal to $p_{(j)}$.
+5. Reject all $H_0$ corresponding to adjusted p-values below $\alpha_{FWER}$.
+
+```{r Simulation 1 - Holm}
+pvalues1[1,] # First set of p-values
+
+p.adjust(pvalues1[1,], method = "holm")
+```
+
+Notice that with 2 p-values, R doubles the smaller one. What happens to the bigger one depends on how close the two p-values are:
+
+```{r Simulation 1 - Holm2}
+pvalues1[6,] # p-values are somewhat close
+
+p.adjust(pvalues1[6,], method = "holm")
+```
+
+```{r Simulation 1 adjusted HOLM}
+adj_pvalues1 <- apply(pvalues1, 1, p.adjust, method = "holm")
+# Weird quirk of apply is that the output is now 2 x 10000 instead of 10000 x 2
+min_adj_pvalues1 <- apply(adj_pvalues1, 2, min)
+hist(min_adj_pvalues1)
+mean(min_adj_pvalues1 <= 0.05)
+```
+
+Again, the probability of rejecting *either* hypothesis has been reduced back to around the $\alpha_{single} = 0.05$ we were expecting.
+
+## ANOVA and Post Hoc Testing
+
+Suppose that subjects are randomly assigned to one of three conditions: Low, Medium, and High, and a response variable $Y$ is recorded from each group.
+
+To illustrate this, we'll randomly generate 60 values from $Y \sim N(0, 1)$ and randomly assign 20 of the values to each condition. 
+
+```{r Simulation 2 - data}
+set.seed(12345)
+simulation2.df <- data.frame(
+  Y = rnorm(60, mean = 0, sd = 1),
+  group  = rep(c("Low", "Medium", "High"), each = 20)  
+  )
+```
+
+Next, we perform a two-sample t-test with $H_a: \mu_1 \neq mu_2$ for each of the three possible comparisons. Note that $H_0: \mu_1 = \mu_2$ is true for all three tests!
+
+```{r Simulation 2 - t-tests}
+t.test(Y ~ group, data = simulation2.df, subset = 1:40)$p.value
+t.test(Y ~ group, data = simulation2.df, subset = 21:60)$p.value
+t.test(Y ~ group, data = simulation2.df, subset = c(1:20, 41:60))$p.value
+```
+
+In this particular case we got lucky and committed no Type I errors. But let's run this simulation 10,000 times and see what happens:
+
+```{r Simulation 2 - many times}
+pvalues2 <- matrix(0, nrow = 10000, ncol = 3)
+
+set.seed(12345)
+
+for (i in 1:nrow(pvalues2)){
+  simulation2.df <- data.frame(
+    Y = rnorm(60, mean = 0, sd = 1),
+    group  = rep(c("Low", "Medium", "High"), each = 20)  
+  )
+
+  pvalues2[i, 1] <- t.test(Y ~ group, data = simulation2.df, 
+                           subset = 1:40)$p.value
+  pvalues2[i, 2] <- t.test(Y ~ group, data = simulation2.df, 
+                           subset = 21:60)$p.value
+  pvalues2[i, 3] <- t.test(Y ~ group, data = simulation2.df, 
+                           subset = c(1:20, 41:60))$p.value
+  
+}
+```
+
+We will commit a Type I Error if *any* of our p-values are below our significance level.
+
+```{r Simulation 2 unadjusted}
+min_pvalues2 <- apply(pvalues2, 1, min)
+hist(min_pvalues2)
+mean(min_pvalues2 <= 0.05)
+```
+
+Notice that the FWER is well above the 5% significance level but slightly (and consistently) below $1 - (1 - 0.05)^3 = 0.1426$ that we would expect from independent tests. This is because the p-values are *not* independent: knowing that we failed to reject $H_0: \mu_L = \mu_M$ and $H_0: \mu_M = \mu_H$, we are less likely to reject $H_0: \mu_L = \mu_H$. Obviously the more groups we have, the more likely it is that *one* of these comparisons will show a significant difference (even if all the means are the same).
+
+To get around this issue, we first perform a test of $H_0: \mu_1 = \mu_2 = \ldots = \mu_K$, indicating that all $K$ groups' population  means are equal, against $H_a:$ the group means are *not all the same*. Then, if we reject $H_0$, we use *post hoc* methods to determine *which* means are significantly different.
+
+Pseudocode for Post Hoc Testing:
+
+1. Perform a one-way ANOVA (or other test) with $H_0: \mu_1 = \mu_2 = \ldots = \mu_K$
+2. If $H_0$ is not rejected, stop. Do not reject any $H_0$ of the form $\mu_i = \mu_j$.
+3. If $H_0$ is rejected, perform hypothesis tests comparing relevant subsets of $\mu_1, \mu_2, \ldots, \mu_K$ and adjust the p-values.
+
+The term *post hoc* refers to the fact that we do not bother doing additional tests unless we are convinced that there is a significant difference to find.
+
+### Tukey's Method
+
+Tukey's method is one of the more commonly used post hoc methods because it allows you to easily get out *simultaneous confidence intervals* for all pairwise differences $\mu_i - \mu_j$ while still controlling the FWER. The idea is to use a confidence interval of the standard
+
+$$
+\text{point estimate} \pm \text{critical value} \times \text{standard error}
+$$
+form, with the tricky parts being what to use for the critical value and the standard error. The standard error is taken as $\sqrt{\frac{MSE}{2}\left(\frac{1}{n_i} + \frac{1}{n_j}\right)}$ (where MSE is the number in the mean squares column, "residuals"/"within groups" row of the ANOVA table) and Tukey worked out an appropriate distribution of critical values. In other words, the margin of error depends *only* on the sample sizes in the two groups being compared.
+
+Let's use the `Hitters` dataset from the ISLR2 package and see if there is a significant difference in 1986 salary between the (at that time) four divisions. Note that an exploratory data analysis will confirm that `Salary` has a quite skewed-right distribution in each group, so ANOVA methods are not really appropriate; here we just use it as an example of "how to run the code."
+
+```{r ANOVA Hitters}
+library(ISLR2)
+library(dplyr)
+Hitters2 <- Hitters |>
+  mutate(
+    Div = paste(League, Division, sep = "")
+  )
+
+# If you just want the ANOVA test, use oneway.test instead
+Hitters_anova <- aov(Salary ~ Div, data = Hitters2)
+summary(Hitters_anova)
+```
+
+Now we want to see *which* divisions there is a difference in mean salary between.
+
+```{r TukeyHSD Hitters}
+TukeyHSD(Hitters_anova)
+```
+
+1. How do we read this table?
+
+### Scheffe's Method
+
+Scheffe's method is used when we would like to deal with *contrasts* of the form
+
+$$
+H_0: \sum_{i=1}^K c_i \mu_i = 0
+$$
+
+where $\sum_{i=1}^K c_i = 0$. Note that we can formulate this as comparing two *sets* of population means, in which the means in set 1 have positive $c_i$, the means in set 2 have negative $c_i$, and the means not being compared have $c_i = 0$.
+
+In practice, you should know which contrasts are of interest *before* peeking at the data. Here we'll just test that the mean in the AL East (AE) is higher than the average of the means in the other 3 divisions.
+
+```{r Scheffe method}
+library(DescTools)
+
+# Define the contrast matrix
+contrast.matrix <- matrix(
+  #AE is alphabetically first so it's the first entry here
+  c(1, -1/3, -1/3, -1/3), # note that the sum of this vector is 0
+  nrow = 4, ncol = 1
+)
+
+# We should do the ANOVA first, but we already did that in the Tukey section
+ScheffeTest(Hitters_anova, contrasts = contrast.matrix)
+```
+
+Note that `lwr.ci` and `upr.ci` represent the lower and upper bound for 
+$$
+(1)(\mu_{AE}) + (-\frac{1}{3})(\mu_{AW}) + (-\frac{1}{3})(\mu_{NE}) + (-\frac{1}{3})(\mu_{NW})
+$$
+
+## False Discovery Rate (FDR)
+
+When the number of tests is very large, the FWER will be very close to 1 unless the individual significance levels are minuscule. Procedures that involve the False Discovery Rate (FDR) give up on trying to control the probability of making *any* Type I Errors.
+
+Formally, letting $R$ represent the number of rejected $H_0$ and $V$ represent the number of false positives, we define the FDR as
+
+$$
+FDR = E(\frac{V}{R}| R > 0)P(R > 0)
+$$
+
+In other words, the FDR represents the expected proportion of false positives among all the $H_0$ we reject (conditional on rejecting any of them).
+
+We typically control the FDR at level $q = 0.10$ or $q = 0.20$. Remember that this doesn't control the probability of making *any* Type I Errors, this controls the expected proportion of Type I Errors among the rejected $H_0$.
+
+### Benjamini-Hochberg Method
+
+Pseudocode for the Benjamini-Hochberg method (traditional way):
+
+1. Define the desired FDR $q$
+2. Compute the p-values $p_1, p_2, \ldots, p_m$ corresponding to $H_{01}, H_{02}, \ldots, H_{0m}$
+3. Order the p-values from smallest to largest, $p_{(1)} \leq p_{(2)} \leq \ldots \leq p_{(m)}$
+4. Compare $p_{(m)}$ to significance level $\frac{q}$. If the corresponding $H_0$ is rejected, STOP.
+5. Compare $p_{(m-1)}$ at significance level $\frac{q(m-1)}{m}$. If the corresponding $H_0$ is rejected, STOP.
+6. Continue comparing p-values $p_{(j)}$ to significance level $\frac{qj}{m}$ one at a time until we get a signficant one.
+7. Reject the $H_0$ corresponding to the significant p-value *as well as* all $H_0$ you have not yet tested.
+
+In practice, R doesn't know the desired FDR, so we have to adjust the p-values instead.
+
+Pseudocode for the Benjamini-Hochberg method (R's way):
+
+1. Compute the p-values $p_1, p_2, \ldots, p_m$ corresponding to $H_{01}, H_{02}, \ldots, H_{0m}$
+2. Order the p-values from smallest to largest, $p_{(1)} \leq p_{(2)} \leq \ldots \leq p_{(m)}$
+3. Multiply each p-value $p_{(j)}$ by $\frac{m}{j}$
+4. If $p_{(j)} \leq p_{(k)}$ before the adjustment in Step 3 but $p_{(j)} > p_{(k)}$ after the adjustment, set the adjusted $p_{(j)}$ equal to $p_{(k)}$.
+5. Reject all $H_0$ corresponding to adjusted p-values below $q$.
+
+```{r Simulation 1 - BH}
+pvalues1[1,] # First set of p-values from earlier simulation
+
+p.adjust(pvalues1[1,], method = "BH")
+```
+
+```{r Simulation 1 - Holm2}
+pvalues1[6,] # p-values are somewhat close
+
+p.adjust(pvalues1[6,], method = "BH")
+```
+
+```{r Simulation 1 adjusted HOLM}
+adj_pvalues1 <- apply(pvalues1, 1, p.adjust, method = "holm")
+# Weird quirk of apply is that the output is now 2 x 10000 instead of 10000 x 2
+min_adj_pvalues1 <- apply(adj_pvalues1, 2, min)
+hist(min_adj_pvalues1)
+mean(min_adj_pvalues1 <= 0.05)
+```

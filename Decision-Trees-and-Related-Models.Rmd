@@ -1,0 +1,741 @@
+---
+title: "Decision Trees and Related Models Example Code and Class Activities"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+#Note 
+Root node: start of the tree - all data points enter this node (typically very top)
+Branch: if a condition is true, go to left node o/w, go to right node.
+terminal node: "end" of the tree-no more branches 
+for regression: y_hat = average y-value of all obs. at the terminal node.
+for classification: y_hat = most prevalent class among all obs. at the terminal node
+
+## Data
+
+Decision trees can be used for both regression and classification problems. For regression, we'll continue to use our Lahman baseball salary data. For classification, we'll continue to use the `Restrain` data and predict fruits/vegetables. 
+
+```{r create batting-2016 data, warning = FALSE, message = FALSE}
+library(Lahman)
+library(tidyverse)
+library(tidymodels)
+library(probably)
+
+salaries <- Salaries %>%
+  dplyr::select(playerID, yearID, teamID, salary)
+peopleInfo <- People %>%
+  dplyr::select(playerID, birthYear, birthMonth, nameLast,
+         nameFirst, bats)
+batting <- battingStats() %>% 
+  left_join(salaries, 
+            by =c("playerID", "yearID", "teamID")) %>%
+  left_join(peopleInfo, by = "playerID") %>%
+  mutate(age = yearID - birthYear - 
+           1L *(birthMonth >= 10)) %>%
+  arrange(playerID, yearID, stint)
+
+batting_2016 <- batting %>% filter(yearID == 2016,
+                                   !is.na(salary),
+                                   G >= 100, AB >= 200
+                                   ) %>%
+  mutate(salary = log10(salary), # there's a reason for this, I promise
+         lgID = factor(lgID, levels = c("AL", "NL"))) # fix the defunct league issue
+
+set.seed(11249)
+batting_2016_split <- initial_split(batting_2016, prop = 0.75)
+batting_train <- training(batting_2016_split)
+batting_test <- testing(batting_2016_split)
+```
+
+```{r import Restrain data}
+Restrain <- readr::read_csv("Restrain.csv")
+fv <- Restrain %>% filter(SubCategory %in% c("Fruits", "Vegetables"))
+fv$SubCategory <- factor(fv$SubCategory, levels = c("Fruits","Vegetables"))
+set.seed(1880)
+fv_split <- initial_split(fv, prop = 0.80) 
+
+fv_train_tidy <- training(fv_split)
+fv_test_tidy <- testing(fv_split)
+```
+
+## Regression Trees
+
+When we create a decision tree, there are three parameters that we can tune:
+
+* `tree_depth` indicates the maximum depth of the tree - the default is 30
+* `min_n` determines whether a node is a terminal node (if there are fewer `min_n` observations at a node, then the node is a terminal node) - the default is 2
+* `cost_complexity` indicates the cost-complexity parameter for tree pruning - the default is 0.01
+
+Here we'll leave the first two parameters at their defaults and tune the cost-complexity parameter.
+
+```{r tree-tidy model}
+treeR_model <- decision_tree(mode = "regression", engine = "rpart",
+                          cost_complexity = tune())
+# let's just tune the cost-complexity parameter
+```
+
+Pre-processing is a good idea but not strictly necessary here.
+
+```{r tree-tidy recipe}
+treeR_recipe <- recipe(
+  salary ~ G +  R + H + X2B + X3B + HR + RBI + 
+                   SB + CS + BB + SO + IBB + HBP + SH + SF + GIDP + 
+                   age + lgID, # response ~ predictors
+  data = batting_train
+)
+
+treeR_wflow <- workflow() |>
+  add_model(treeR_model) |>
+  add_recipe(treeR_recipe)
+```
+
+Now we can do the cross-validation.
+
+```{r tune model kfold 1}
+set.seed(1332)
+batting_kfold <- vfold_cv(batting_train, v = 5, repeats = 3) 
+
+treeR_tune1 <- tune_grid(treeR_model, 
+                      treeR_recipe, 
+                      resamples = batting_kfold, 
+                      metrics = metric_set(rmse), # ignore r-squared, we get warning messages
+                      grid = grid_regular(cost_complexity(range = c(-3, 0)), levels = 10))
+```
+
+The `range` argument is actually on the log10-scale, in other words, we are searching from $10^{-3}$ (very little pruning) to $10^0 = 1$. If we wanted finer control over our grid, we'd use `expand.grid` to set up our grid manually.
+
+```{r tune model kfold 2}
+treeR_tune1 |>
+  collect_metrics() |> # no need to filter for RMSE because it's the only one 
+  ggplot(mapping = aes(x = cost_complexity, y = mean)) + 
+  geom_point() + 
+  geom_line() +
+  scale_x_log10()
+```
+
+# Note lower cost_complexity has more splits(more terminal nodes). For in this case, like 1 cost_complexity, it does only have 1 terminal node. 
+
+1. Suppose we are using the one-standard-error rule. Will smaller values of `cost_complexity` or larger values result in simpler models? Why? 
+
+2. In my comments I said that we get a warning using R-squared. Recall that we get this warning when every observation is predicted to have the same value. In that case, what would the tree look like?
+
+```{r select best tree}
+treeR_best <- select_by_one_std_err(
+  treeR_tune1,
+  metric = "rmse",
+  desc(cost_complexity)
+)
+treeR_best
+```
+
+Now we finalize our workflow and look at how well calibrated the model is:
+
+```{r finalize tree}
+treeR_wflow_final <- finalize_workflow(treeR_wflow, parameters = treeR_best) 
+
+treeR_pred_check <- treeR_wflow_final |>
+  fit_resamples(
+    resamples = batting_kfold,
+    # save the cross-validated predictions
+    control = control_resamples(save_pred = TRUE)
+) |> 
+  collect_predictions()
+
+ggplot(treeR_pred_check, aes(x = salary, y = .pred)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "blue")
+```
+
+Well, this certainly looks different from the linear regression models!
+
+3. Explain why we see this pattern - a bunch of horizontal bands - instead.
+
+Assuming we're okay with this somehow-worse-than-linear-regression calibration, we fit the model on the full training set:
+
+```{r fit tree-tidy model}
+treeR_fit <- fit(treeR_wflow_final, data = batting_train)
+treeR_fit
+```
+
+and investigate what the model actually looks like:
+
+```{r look at tree}
+extract_fit_engine(treeR_fit) |>
+  plot(ylim = c(-0.2, 1.2))
+extract_fit_engine(treeR_fit) |>
+  text()
+```
+
+3. Explain how to read this tree.
+
+We then make predictions on the holdout set:
+
+```{r augment tree fit}
+predictions_treeR <- broom::augment(treeR_fit, new_data = batting_test)
+predictions_treeR |> dplyr::select(
+  nameFirst, nameLast, age, HR, salary, .pred
+)
+```
+
+4. Explain why Javier Baez and Mookie Betts are predicted to have the same salary, even though Baez hit fewer than 14.5 home runs and Betts hit more than 14.5 home runs.
+
+## Classification Trees
+
+Because we already set up the decision tree model, we can just update it to do classification using `set_mode`:
+
+```{r treeC-tidy model}
+treeC_model <- set_mode(treeR_model, "classification")
+
+# Equivalent to:
+treeC_model <- decision_tree(mode = "classification", engine = "rpart", cost_complexity = tune())
+# because we are still using rpart and tuning the cost-complexity parameter
+
+```
+
+Pre-processing is a good idea but not strictly necessary here. Remember that we are using entirely different data to do entirely different predictions, so we do have to set up the new recipe.
+
+```{r treeC-tidy recipe}
+treeC_recipe <- recipe(
+  SubCategory ~ Taste + Healthiness + Cravings,
+  data = fv_train_tidy
+)
+
+treeC_wflow <- workflow() |>
+  add_model(treeC_model) |>
+  add_recipe(treeC_recipe)
+```
+
+Now we can do the cross-validation. Traditionally, mean log-loss is used to choose the best decision tree model, so we'll look at that.
+
+```{r tune Cmodel kfold 1}
+set.seed(1332)
+fv_kfold <- vfold_cv(fv_train_tidy, v = 5, repeats = 3) 
+
+treeC_tune1 <- tune_grid(treeC_model, 
+                      treeC_recipe, 
+                      resamples = fv_kfold, 
+                      metrics = metric_set(mn_log_loss),
+                      grid = grid_regular(cost_complexity(range = c(-3, 2)), levels = 10))
+
+autoplot(treeC_tune1)
+```
+
+1. Given this graph, do lower values of the cost-complexity parameter or higher values suggest a better model?
+
+```{r select best treeC}
+treeC_best <- select_by_one_std_err(
+  treeC_tune1,
+  metric = "mn_log_loss",
+  desc(cost_complexity)
+)
+treeC_best
+```
+
+Now we finalize our workflow and fit the model on the training set:
+
+```{r fit treeC-tidy model}
+treeC_wflow_final <- finalize_workflow(treeC_wflow, parameters = treeC_best) 
+
+treeC_fit <- fit(treeC_wflow_final, data = fv_train_tidy)
+treeC_fit
+```
+
+```{r look at treeC, eval = FALSE}
+extract_fit_engine(treeC_fit) |>
+  plot(ylim = c(-0.2, 1.2))
+```
+
+2. Explain why this code gives us an error. What would you expect the predictions on the holdout set to be?
+
+```{r augment treeC fit}
+broom::augment(treeC_fit, new_data = fv_test_tidy) |>
+  conf_mat(truth = SubCategory, estimate = .pred_class)
+```
+
+### Multiclass Classification
+
+Let's see if we can do any better with the savory-sweet-takeout prediction.
+
+```{r Restrain again}
+Restrain2 <- Restrain |> 
+  filter(!(SubCategory %in% c("Fruits", "Vegetables"))) |>
+  mutate(SubCategory =
+  fct_collapse(SubCategory,
+    savory = c("Bakery (savoury)", "Savoury snacks"),
+    sweet = c("Bakery (sweet)", "Biscuits", "Confectionery", "Desserts"),
+    takeout = c("Takeaway (chain)", "Takeaway (generic)")
+    )
+)
+
+set.seed(1880)
+Restrain_split <- initial_split(Restrain2, prop = 0.80) 
+Restrain_train_tidy <- training(Restrain_split)
+Restrain_valid_tidy <- testing(Restrain_split)
+```
+
+Since we have literally the same predictor and response variables (same names and same meanings), we don't actually have to update the model! We just have to make sure it gets fit on the right data:
+
+```{r tune treeC for Restrain2}
+set.seed(1332)
+res_kfold <- vfold_cv(Restrain_train_tidy, v = 5, repeats = 3) 
+
+treeC_tune2 <- tune_grid(treeC_model, 
+                      treeC_recipe, 
+                      resamples = res_kfold, 
+                      metrics = metric_set(mn_log_loss),
+                      grid = grid_regular(cost_complexity(range = c(-3, 0)), levels = 10))
+
+autoplot(treeC_tune2)
+
+treeC_best2 <- select_by_one_std_err(
+  treeC_tune2,
+  metric = "mn_log_loss",
+  desc(cost_complexity)
+)
+treeC_best2
+```
+
+```{r fit treeC an actual tiny tree}
+treeC_wflow2_final <- finalize_workflow(treeC_wflow, parameters = treeC_best2) 
+
+treeC_fit2 <- fit(treeC_wflow2_final, data = Restrain_train_tidy)
+
+extract_fit_engine(treeC_fit2) |>
+  plot(ylim = c(-0.2, 1.2))
+extract_fit_engine(treeC_fit2) |>
+  text()
+```
+
+We can tell even without looking any any calibration that this is going to be a mess - we have only 3 nodes, a root node and 2 terminal nodes, and no way to predict a savory food.
+
+#Note Greedy algorithm makes optimal decision on each step.
+May not find the overall optimal sol'n
+
+Decision trees are super-sensative to small changes in training data
+(high variance at reasonable # of nodes)
+Ensemble models fit a bunch of high-varance models and "average" the resulting predictions.
+
+
+## Bagging and Random Forests(TM)
+
+
+This result is not unusual: decision trees are great for interpretability but not great for prediction, mostly because they are incredibly high-variance. The good news is that we can grow a whole bunch of terrible trees, and "on average" their predictions are likely to be okay.
+
+We generally have two options for growing trees in parallel: bagging and random forests. The default tidymodels engine for both methods is  the `ranger` package. However, there is also an option to use the `randomForest` package, which is what the book uses. There are a few minor differences in terms of what comes out of the model, but generally, just pick one and `set_engine` to that one.
+
+### Parameters To Tune
+
+There are three parameters that we can tune:
+
+* `trees` indicates the number of trees to fit - the default is 500
+* `mtry` indicates the number of predictors that will be randomly selected at each split - the default varies between engines
+* `min_n` determines whether a node is a terminal node (if there are fewer `min_n` observations at a node, then the node is a terminal node) - the default is 5 for regression and 10 for classification
+
+The main difference between random forests and bagging is in `mtry`: for bagging, we explicitly set `mtry` to the number of predictors in the dataset, while for random forests, we tune the value of `mtry`. 
+
+1. Why might tuning the value of `mtry` and not using every predictor on every split result in better predictions?
+
+2. If we fit 500 decision trees on the same training set, we will get 500 of the same exact tree. How do we ensure the trees are different?
+
+### Bagging for Regression
+
+The model for bagging and random forests is `rand_forest`. Because we are doing some bootstrapping, we need to set a seed for reproducibility. We will set this using the `set_args` function.
+
+```{r bagging-tidy model}
+baggingR_recipe <- recipe(
+  salary ~ G +  R + H + X2B + X3B + HR + RBI + 
+                   SB + CS + BB + SO + IBB + HBP + SH + SF + GIDP + 
+                   age + lgID, # response ~ predictors
+  data = batting_train
+)
+
+baggingR_model <- rand_forest(mode = "regression", 
+                              engine = "ranger") |>
+  set_args(seed = 395,
+           importance = "permutation",
+           mtry = .cols())
+# you can use .cols() or .preds(); .preds() works before dummy variables are created and .cols() works afterwards
+
+baggingR_wflow <- workflow() |>
+  add_model(baggingR_model) |>
+  add_recipe(baggingR_recipe)
+```
+
+1. Explain what `importance = "permutation"` means.
+
+Since we have not tuned anything, and decision trees rarely require pre-processing, we can go straight to fitting:
+
+```{r fit bagging-tidy model}
+baggingR_fit <- fit(baggingR_wflow, data = batting_train)
+baggingR_fit
+```
+
+```{r baggingR get OOB MSE}
+baggingR_engine <- baggingR_fit |>
+  extract_fit_engine()
+baggingR_engine |>
+  pluck("prediction.error")
+```
+
+2. What is OOB prediction error and how is it computed?
+
+Let's look at our calibration plot:
+
+```{r calibration plot baggingR}
+baggingR_pred_check <- tibble(
+  salary = batting_train$salary,
+  .pred = baggingR_engine |> pluck("predictions")
+)
+
+ggplot(baggingR_pred_check, aes(x = salary, y = .pred)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "blue")
+```
+
+3. How are these predictions made? Why do we know the predicted values despite not doing any cross-validation?
+
+Bagging can be useful for feature selection; we can use a variable importance plot to identify the most "important" variables.
+
+```{r vip baggingR}
+baggingR_engine |>
+  pluck("variable.importance")
+
+# You can plot this manually or use the vip package
+library(vip)
+vip(baggingR_engine)
+```
+#Note: Variable Importance
+Option 1: Average the total amount by which RSS/Gini index/etc. decreases due to splits involving this predictors over all trees.
+Option 2: Permutation - based importance 
+For each predictor: 
+Randomly reshuffle values of that predictor only
+Record the increase in OOB error rate compared to "good" trees fit on original data.
+
+4. What does a negative value for variable importance in this model mean?
+That variable is not important at all.
+
+If we want to get something that looks like Figure 8.9 in the book, change the `scale` argument to make the longest bar go out to 100:
+
+```{r vip baggingR with extra stuff}
+vip(baggingR_engine, scale = TRUE)
+```
+
+Finally we make and evaluate our predictions on the validation set:
+
+```{r augment baggingR fit}
+predictions_baggingR <- broom::augment(baggingR_fit, new_data = batting_test)
+predictions_baggingR |> dplyr::select(
+  nameFirst, nameLast, salary, .pred
+)
+rmse(predictions_baggingR, truth = salary, estimate = .pred)
+```
+
+
+### Random Forests for Regression
+
+If we want to use random forests, then we just need to tune the value of `mtry` instead of set it to the number of predictors. We'll use `update` to tell R that we want to slightly alter the bagging model.
+
+```{r rf-tidy model}
+rfR_model <- update(baggingR_model, mtry = tune())
+
+rfR_wflow <- workflow() |>
+  add_model(rfR_model) |>
+  add_recipe(baggingR_recipe) # same recipe as earlier
+```
+
+Now we do have to tune the model:
+
+```{r tune model kfold rfR}
+# I'm sure there's a better way, but this works
+n_predictors <- sum(baggingR_recipe$var_info$role == "predictor")
+manual_grid <- expand.grid(mtry = seq(1, n_predictors))
+# maybe don't search over the entire grid if you have a ton of predictors
+rfR_tune1 <- tune_grid(rfR_model, 
+                      baggingR_recipe, 
+                      resamples = batting_kfold, 
+                      metrics = metric_set(rmse, mae),
+                      grid = manual_grid)
+
+autoplot(rfR_tune1)
+```
+1. Do you expect the models with a smaller or larger value of `mtry` to take longer to fit? Why?
+
+```{r select best rf}
+rfR_best <- select_by_one_std_err(
+  rfR_tune1,
+  metric = "rmse",
+  mtry
+)
+rfR_best
+```
+
+Now we finalize our workflow and fit the model on the training set:
+
+```{r fit rf-tidy model}
+rfR_wflow_final <- finalize_workflow(rfR_wflow, parameters = rfR_best) 
+rfR_fit <- fit(rfR_wflow_final, data = batting_train)
+rfR_fit
+```
+
+We still like to get the out-of-bag prediction error and look at the model calibration and variable importance:
+
+```{r rfR get OOB MSE}
+rfR_engine <- rfR_fit |>
+  extract_fit_engine()
+rfR_engine |> pluck("prediction.error")
+
+rfR_pred_check <- tibble(
+  salary = batting_train$salary,
+  .pred = rfR_engine |> pluck("predictions")
+)
+
+ggplot(rfR_pred_check, aes(x = salary, y = .pred)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "blue")
+```
+
+Again, note that the bootstrap is doing the work of making out-of-sample predictions, rather than cross-validation.
+
+```{r vip rfR with extra stuff}
+vip(rfR_engine, scale = TRUE)
+```
+
+2. Compare the variable importance plot for the bagging model to the variable importance plot for the random forest model. Why do you think some variables have quite different importance in the two models?
+
+### Bagging and Random Forests for Classification
+
+```{r rfC-tidy model}
+rfC_model <- rand_forest(mode = "classification", engine = "ranger") |>
+  set_args(seed = 395,
+           importance = "permutation",
+           mtry = 4
+  )
+
+rfC_recipe <- recipe(
+  SubCategory ~ Taste + Healthiness + Cravings,
+  data = fv_train_tidy
+)
+
+
+rfC_wflow <- workflow() |>
+  add_model(rfC_model) |>
+  add_recipe(rfC_recipe)
+```
+
+Now we tune the model:
+
+```{r tune model kfold rfC}
+# I'm sure there's a better way, but this works
+n_predictorsC <- sum(rfC_recipe$var_info$role == "predictor")
+manual_gridC <- expand.grid(mtry = seq(1, n_predictorsC))
+
+rfC_tune1 <- tune_grid(rfC_model, 
+                      rfC_recipe, 
+                      resamples = fv_kfold, 
+                      metrics = metric_set(mn_log_loss, accuracy),
+                      grid = manual_gridC)
+
+autoplot(rfC_tune1)
+```
+
+Here it looks like considering two predictors instead of all three on each split maximizes cross-validated accuracy, but considering only one randomly selected predictor does best by mean log-loss. Using our rule of thumb to use probability-based error metrics whenever possible, I'm going to go with the mean log-loss minimizer:
+
+```{r select best rfC}
+rfC_best <- select_best(
+  rfC_tune1,
+  metric = "mn_log_loss",
+  mtry=
+)
+```
+
+Now we finalize our workflow and fit the model on the training set:
+
+```{r fit rfC-tidy model}
+rfC_wflow_final <- finalize_workflow(rfC_wflow, parameters = rfC_best) 
+rfC_fit <- fit(rfC_wflow_final, data = fv_train_tidy)
+rfC_fit
+```
+
+1. What classification accuracy metric is being used to evaluate the OOB prediction error for a classification model with `ranger`?
+
+```{r rfC OOB Brier Score and vip}
+rfC_engine <- rfC_fit |> extract_fit_engine()
+
+rfC_engine |> pluck("prediction.error")
+
+vip(rfC_engine, scale = TRUE)
+```
+
+
+## Boosted Trees
+
+Rather than growing trees in parallel, boosting models grow trees in series, with each new tree being fit on the previous tree's errors.
+
+There are many different packages that run their own variants of gradient-boosted trees. As far as I am aware, the currently most popular version is the `xgboost` (eXtreme Gradient BOOSTing) algorithm, which is implemented in a number of languages including R and Python. We'll use the tidymodels interface to xgboost.
+
+### Parameters to Tune in `xgboost`
+
+There are 8 tunable parameters. The ones we aren't going to worry about:
+
+* `mtry` indicates the number of predictors that will be randomly selected at each split - the default is to use all the predictors, but if you have a ton of predictors you may want to tune this.
+* `min_n` and `loss_reduction` jointly determine whether a node is a terminal node - if the number of observations at a node is below `min_n`, or all possible splits decrease the loss function by less than `loss_reduction`, the node is a terminal node. The default for `min_n` is 1 and the default for `loss_reduction` is 0. Larger values will give more conservative models.
+* `sample_size` is the proportion of observations available to be selected each time a new tree is fit. See the *Stochastic Gradient Descent* section of my course notes.
+* `stop_iter` governs what happens if the model gets stuck in a rut - if the model does not improve after `stop_iter` number of iterations, the fitting process stops even if not all the trees have been fit
+
+The ones we care about:
+
+* `trees` indicates the number of trees to fit, or in other words, the number of iterations to run the model for - the default is 15. This should almost always be tuned because when this value is too large we tend to overfit.
+* `learn_rate` controls how much each new tree contributes to the estimate of $f$ - the default is 0.3. This should be tuned every time you tune the value of `trees`.
+* `tree_depth` controls the interaction depth of the trees - the default is 6, which can support up to six-way interactions. If you tune this, make sure you include a value of 1 (purely additive model) in your grid.
+
+### Regression
+
+`xgboost` cannot work with categorical variables, so we need to convert to indicator variables. However, we do not need to standardize the quantitative predictor variables: 
+
+```{r xgboost R}
+xgboostR_model <- boost_tree(mode = "regression", engine = "xgboost",
+                            trees = tune(), tree_depth = tune(),
+                            learn_rate = tune())
+
+xgboostR_recipe <- recipe(
+  salary ~ G +  R + H + X2B + X3B + HR + RBI + 
+                   SB + CS + BB + SO + IBB + HBP + SH + SF + GIDP + 
+                   age + lgID, # response ~ predictors
+  data = batting_train
+) |>
+  step_dummy(all_nominal_predictors())
+
+xgboostR_wflow <- workflow() |>
+  add_model(xgboostR_model) |>
+  add_recipe(xgboostR_recipe)
+```
+
+Because we have a bunch of tuning parameters, it's recommended to set up your tuning grid manually. However, if you really have no idea what parts of the parameter space you should be searching in (which is not unusual), you can use an algorithm such as `grid_max_entropy` or `grid_latin_hypercube` that will ensure that the optimal solution is "not too far" from a set of parameter values in the grid; then you might consider setting up a manual grid once you have an idea of where to "zoom in". Because those algorithms do some random sampling from the parameter space to determine the grid, it's best to set a seed before doing the tuning if you're using those functions. 
+
+The tuning does take a bit of time to run:
+
+```{r tune parameters xgboostR}
+set.seed(1486)
+xgboostR_tune <- tune_grid(xgboostR_model, 
+                      xgboostR_recipe, 
+                      resamples = batting_kfold,
+                      metrics = metric_set(rmse),
+                      grid = grid_latin_hypercube(
+                        trees(), 
+                        tree_depth(), 
+                        learn_rate(), 
+                        size = 20)) # search over 20 possible combinations of the three parameters - keep this small if you don't want it running forever
+```
+
+Let's get the best model:
+
+```{r select best}
+xgboostR_tune |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  arrange(mean)
+```
+
+Here there are 3 models that all perform relatively similarly. When we have to choose between models of similar cross-validated RMSE:
+
+* Models with lower interaction depth are simpler
+* Models with fewer trees and a higher learning rate tend to fit faster
+
+I tend to prioritize low interaction depth over the other two parameters, but I'm not sure if that's "best practice."
+
+```{r finalize xgboostR}
+xgboostR_best <- select_by_one_std_err(xgboostR_tune, 
+                             metric = "rmse", 
+                             tree_depth, trees, desc(learn_rate))
+xgboostR_wflow_final <- finalize_workflow(xgboostR_wflow, 
+                                          parameters = xgboostR_best) 
+```
+
+```{r fit and predict xgboostR}
+xgboostR_fit <- fit(xgboostR_wflow_final, data = batting_train)
+xgboostR_predict <- augment(xgboostR_fit, new_data = batting_test)
+xgboostR_predict |> 
+  dplyr::select(nameLast, nameFirst, salary, .pred) |>
+  dplyr::slice(1:10) # must use dplyr::slice because there is also a slice function in xgboost
+rmse(xgboostR_predict, truth = salary, estimate = .pred)
+```
+
+Because boosted trees are just another type of tree ensemble, we can still get variable importance out:
+
+```{r vip xgboostR}
+xgboostR_fit |> extract_fit_engine() |>
+      vip(scale = TRUE)
+```
+
+2. Compare the variable importance plot for the boosted model to the variable importance plot for the bagging and random forest models. Why do you think some variables have quite different importance in the different models?
+
+### Classification with `xgboost`
+
+```{r xgboost C}
+xgboostC_model <- boost_tree(mode = "classification", engine = "xgboost",
+                            trees = tune(), tree_depth = tune(),
+                            learn_rate = tune())
+
+# No categorical predictors here, don't worry about step_dummy()
+xgboostC_recipe <- recipe(
+  SubCategory ~ Taste + Healthiness + Cravings,
+  data = fv_train_tidy
+) 
+
+xgboostC_wflow <- workflow() |>
+  add_model(xgboostC_model) |>
+  add_recipe(xgboostC_recipe)
+```
+
+```{r tune parameters xgboostC}
+set.seed(1486)
+xgboostC_tune <- tune_grid(xgboostC_model, 
+                      xgboostC_recipe, 
+                      resamples = fv_kfold,
+                      metrics = metric_set(accuracy, mn_log_loss),
+                      grid = grid_latin_hypercube(
+                        trees(), 
+                        tree_depth(c(1,3)), # above 3-way interaction would require polynomial functions of predictors
+                        learn_rate(), 
+                        size = 20)) # search over 20 possible combinations of the three parameters
+```
+
+```{r check kfold results xgboostC}
+autoplot(xgboostC_tune)
+```
+
+Notice that since we are tuning over 3 parameters, we now have a grid showing each different tuning parameter in its own column.
+
+While several models appear to be competitive based on accuracy, one model clearly has the best mean log-loss.
+
+```{r select best xgboostC}
+xgboostC_best <- select_by_one_std_err(
+  xgboostC_tune,
+  metric = "mn_log_loss",
+ tree_depth, trees, desc(learn_rate)
+)
+```
+
+Now we finalize our workflow and fit the model on the training set:
+
+```{r fit xgboostC-tidy model}
+xgboostC_wflow_final <- finalize_workflow(xgboostC_wflow, parameters = xgboostC_best) 
+
+xgboostC_fit <- fit(xgboostC_wflow_final, data = fv_train_tidy)
+xgboostC_fit
+```
+
+2. What is this data frame showing?
+
+```{r predictions and vip xgboostC}
+xgboostC_predict <- augment(xgboostC_fit, new_data = fv_test_tidy)
+xgboostC_predict |>
+  dplyr::select(Food, SubCategory, .pred_class, .pred_Fruits, .pred_Vegetables)
+
+mn_log_loss(xgboostC_predict, truth = SubCategory, .pred_Fruits, event_level = "first")
+
+xgboostC_fit |> extract_fit_engine() |>
+      vip(scale = TRUE)
+```

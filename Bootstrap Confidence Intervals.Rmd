@@ -1,0 +1,351 @@
+---
+title: "Bootstrap Confidence Intervals: Worked Example"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Constructing a Bootstrap Confidence Interval
+
+Let's start by obtaining our bootstrap resamples. We'll continue to use the Auto dataset from the last activity, and we'll need all the other packages from the last activity too.
+
+```{r load packages}
+library(ISLR2)
+library(dplyr)
+library(rsample) # using tidymodels
+library(purrr)
+```
+
+```{r get bootstrap estimates manually}
+n.cars <- nrow(Auto)
+
+B <- 10000 # 10,000 resamples
+mpg.boot <- numeric(B)
+
+set.seed(35794)
+for (i in 1:B){
+  # Step 1: Sample WITH REPLACEMENT a sample of size n from the original data
+  resample <- sample(Auto$mpg, size = n.cars, replace = TRUE)  
+  
+  # Step 2: Compute the statistic of interest and store in the output vector
+  mpg.boot[i] <- mean(resample)
+}
+
+hist(mpg.boot)
+abline(v = mean(Auto$mpg), col = "red", lty = 2)
+```
+
+Now we have `B = 10000` bootstrap estimates of the population mean. Remember that our sampling distribution is not centered at the actual population mean, but rather the sample mean. This is not a bad thing - remember that our "traditional Math 338" confidence intervals are *also* centered at the sample mean!
+
+### Bootstrap Percentile Confidence Interval
+
+This is the simplest method for getting a confidence interval. In this method, we simply find the $\alpha/2$ and $1 - \alpha/2$ percentiles of the bootstrap sampling distribution.
+
+```{r percentile CI manual}
+C <- 0.95
+alpha <- 1 - C
+mpg.boot.pctile <- quantile(mpg.boot, probs = c(alpha/2, 1 - alpha/2))
+mpg.boot.pctile
+```
+
+### Bootstrap "Basic" Confidence Interval
+
+In a sense, the "basic" confidence interval "inverts" the percentile interval. When the bootstrap sampling distribution is symmetric, the two methods produce identical results. When the distribution is skewed, they can give quite different results.
+
+Using the formulas from the course notes:
+
+```{r basic CI manual}
+mean.mpg <- mean(Auto$mpg)
+mpg.boot.basic <- rev(2 * mean.mpg - mpg.boot.pctile)
+mpg.boot.basic
+```
+
+Since our bootstrap sampling distribution was roughly symmetric, we get very similar bounds using the two methods.
+
+### Bootstrap Normal-Theory and t Confidence Intervals
+
+The "normal-theory" and "t" bootstrap confidence intervals use the traditional form for a confidence interval:
+
+$$
+point \ estimate \pm critical \ value \times standard \ error 
+$$
+
+but use the bootstrap standard error. This is extremely useful when the bootstrap sampling distribution looks approximately normal, but the statistic does not have a nice closed-form solution for standard error.
+
+```{r bootstrap normal theory manual}
+crit.z <- qnorm(alpha/2, lower.tail = F) # upper 2.5%
+
+se.mpg <- sd(mpg.boot)
+
+mpg.boot.normal <- mean.mpg + c(-1, 1) * crit.z * se.mpg
+mpg.boot.normal
+```
+
+```{r bootstrap t manual}
+crit.t <- qt(alpha/2, df = n.cars - 1, lower.tail = F)
+
+mpg.boot.t <- mean.mpg + c(-1, 1) * crit.t * se.mpg
+mpg.boot.t
+
+```
+
+Because we have 391 degrees of freedom, the two methods produce extremely similar results here.
+
+### A Better "Bootstrap t" Confidence Interval
+
+In this and the next section we get to the "best" confidence interval methods - ones that tend to work no matter what your population distribution looks like.
+
+Here we leverage the formula for a t-statistic:
+
+$$
+t = \frac{\text{estimate} - \text{parameter}}{\text{SE of estimator}}
+$$
+
+We construct a bootstrap sampling distribution of the t-statistics and use that distribution directly to get the critical values. The problem is that we often don't have an analytical formula for standard error, and even in situations where we do it's often better to estimate the standard error by *resampling from the bootstrap resample*. This is referred to as an "iterated bootstrap."
+
+```{r bootstrap t statistics manually}
+B1 <- 1000 # let's only do 1000 on each iteration
+B2 <- 1000 # so this only takes a while and not forever
+
+mean.boot <- numeric(B1) # sample means
+t.mean.boot <- numeric(B1) # sample t-statistics
+
+set.seed(35794)
+for (i in 1:B1){
+  # Step 1: Sample WITH REPLACEMENT a sample of size n from the original data
+  resample <- sample(Auto$mpg, size = n.cars, replace = TRUE)  
+  
+  # Step 2: Compute the statistic of interest and store in the output vector
+  resample.mean <- numeric(B2) # reset iterated bootstrap means
+  for(j in 1:B2){
+    resample2 <- sample(resample, size = n.cars, replace = TRUE)
+    resample.mean[j] <- mean(resample2)
+  }
+  
+  mean.boot[i] <- mean(resample)
+  t.mean.boot[i] <- (mean.boot[i] - mean.mpg)/sd(resample.mean)
+
+}
+```
+
+We can now directly obtain the critical values from our bootstrap t-distribution rather than assuming the t-distribution will give us the correct critical values.
+
+One quirk is that because the bootstrap t-distribution is not symmetric, $t_{\alpha/2} \neq - t_{1 - \alpha/2}$, and therefore it is important to think about whether to use addition or subtraction to obtain the bounds. Subtraction is mathematically correct.
+
+```{r ci with bootstrap t-statistics manual}
+# Because we are subtracting, put the positive CV first
+crit.mean.boot <- quantile(t.mean.boot, c(1-alpha/2, alpha/2))
+
+se.mean.boot <- sd(mean.boot)
+
+mpg.mean.t.boot <- mean.mpg - crit.mean.boot * se.mean.boot
+mpg.mean.t.boot
+
+```
+
+### Bootstrap Bias-Corrected and Accelerated (BCa) Confidence Interval
+
+The BCa method "adjusts" the bounds of the percentile confidence interval to (usually) preserve its properties while minimizing the disadvantages, at the cost of additional computation.
+
+```{r BCa method manually}
+# start with bias correction
+prop.below.orig <- sum(mpg.boot <  mean.mpg)/B
+z0.hat <- qnorm(prop.below.orig)
+
+# acceleration requires jackknifing
+jackknife.estimates <- numeric(n.cars)  # we remove each observation once
+for (i in 1:n.cars){
+  newdata <- Auto$mpg[-i]  # remove the ith observation from the vector
+  jackknife.estimates[i] <- mean(newdata)  # compute the mean of all but the ith observation
+}
+
+jackknife.mean <- mean(jackknife.estimates)
+
+a.temp <- jackknife.mean - jackknife.estimates
+a.numerator <- sum(a.temp^3)
+a.denominator <- 6*(sum(a.temp^2))^(3/2)
+a.hat <- a.numerator/a.denominator
+
+# compute the corrections
+fraction.low <- (z0.hat + qnorm(alpha/2))/(1 - a.hat*(z0.hat + qnorm(alpha/2)))
+fraction.high <- (z0.hat + qnorm(1-alpha/2))/(1 - a.hat*(z0.hat + qnorm(1-alpha/2)))
+
+# compute the actual quantiles based on the corrections
+BCa.quantiles <- pnorm(c(fraction.low, fraction.high))
+
+# compute the confidence interval
+mpg.boot.bca <- quantile(mpg.boot, probs = BCa.quantiles)
+mpg.boot.bca
+```
+
+Because this is reasonably well-behaved data, percentile and BCa methods give pretty close answers. 
+
+## Constructing Bootstrap Confidence Intervals Using `boot`
+
+```{r load boot}
+library(boot)
+```
+
+Just like when we estimated standard error, we first have to set up a custom function with two arguments. The first argument represents the dataset (usually a data frame) that we want to resample from and the second argument represents the (row) indices corresponding to the rows.
+
+```{r Step 1 define function}
+boot_mean_mpg <- function(df, indices){
+  
+    # easiest way: just get the resampled data frame...
+  resample <- df[indices,]
+  
+  # ...and then get the statistic
+  return(mean(resample$mpg))
+}
+```
+
+Once we set up the function, we pass this function as an argument to `boot`:
+
+```{r Step 2 use boot to get bootstrap estimates}
+set.seed(12)
+boot.Auto <- boot(Auto, boot_mean_mpg, R = 1000)
+```
+
+Finally, we construct the confidence intervals automatically using `boot.ci`:
+
+```{r Step 3 use boot.ci to get bootstrap ci}
+boot.ci.Auto <- boot.ci(boot.Auto,
+                        conf = 0.95, # 95% CI
+                        type = c("norm", "basic", "perc", "bca") # pick the ones you want
+                        )
+print(boot.ci.Auto)
+```
+
+To get the "studentized" intervals, we need to return both the estimate *and* its (squared) estimated standard error. This requires some thought, because we don't want to deal with infinite recursion.
+
+```{r Step 1 define function for studentized}
+boot_inner <- function(df, indices){
+
+    resample <- df[indices,]
+    
+    xbar_B <- mean(resample$mpg)
+    return(xbar_B)
+}
+
+boot_outer <- function(df, indices, inner_R){
+  
+  resample <- df[indices,]
+  
+  xbar <- mean(resample$mpg)
+  
+  boot_xbar_inner <- boot(resample, boot_inner, R = inner_R)
+
+  boot_var_xbar <- var(boot_xbar_inner$t)
+
+  return(c(xbar, boot_var_xbar))
+}
+```
+
+```{r Step 2 and 3 for studentized}
+# we should really use a bigger number than 100 for inner bootstrap
+# but inner_R = 1000 takes forever on my computer
+boot.Auto2 <- boot(Auto, boot_outer, R = 1000, inner_R = 100)
+boot.ci.stud <- boot.ci(boot.Auto2,
+                        conf = 0.95, # 95% CI
+                        type = c("stud")
+                        )
+print(boot.ci.stud)
+```
+
+## Constructing Bootstrap Confidence Intervals Using `tidymodels`
+
+Following the ideas from last time, we create all of our bootstrap resamples at once. If we want to do a BCa or studentized t-interval, we need to include `apparent = TRUE` so that tidymodels can figure out the appropriate corrections based on the original data. If we just want a bootstrap percentile interval, we don't need that argument.
+
+```{r create bootstrap resamples with rsample}
+set.seed(466)
+boot_Auto2 <- bootstraps(Auto, times = 1000, apparent = TRUE)
+```
+
+Next, we define our function to return our bootstrap estimates. For percentile and BCa intervals we can leave the `std.error` blank. Most of the time `std.error` is being computed from a model and will automatically get filled in.
+
+```{r bootstrap mean function with rsample}
+boot_mean_mpg_tidy <- function(split, ...){
+  # "split" is the set of resamples that we're going to be passing
+  # ... is for other arguments we might want to pass in
+
+  # we use the analysis() function to extract the actual data
+  x <- analysis(split)
+  
+  param_estimate <- tibble(
+    term = "mean",
+    estimate = mean(x$mpg),
+    std.error = NA_real_
+  )
+  
+  return(param_estimate)
+}
+
+```
+
+This is where things are going to get a little weird. When we map over our bootstrap splits, we add the output as a new variable *in the tibble with the bootstraps*:
+
+```{r get bootstrap estimates}
+boot_means <- boot_Auto2 |>
+  mutate(
+    results = map(splits, boot_mean_mpg_tidy)
+  )
+head(boot_means)
+boot_means$results[1]
+```
+
+We can now get out the percentile and BCa intervals.
+
+```{r get intervals}
+int_pctl(boot_means, results, alpha = 0.05)
+int_bca(boot_means, results, alpha = 0.05, .fn = boot_mean_mpg_tidy)
+```
+
+The studentized t-interval is a bit messier because we have to code two separate functions for the inner and outer bootstrap resamples (otherwise we get into recursion issues).
+
+```{r iterated bootstrap with rsample}
+boot_inner_tidy <- function(split, ...){
+  x <- analysis(split)
+  
+  xbar_B <- mean(x$mpg)
+  
+  return(xbar_B)
+}
+
+boot_outer_tidy <- function(split, inner_seed, inner_R, ...){
+  # "split" is the set of resamples that we're going to be passing
+  # ... is for other arguments we might want to pass in
+  # generally we don't deal with this directly
+  
+
+  # we use the analysis() function to extract the actual data
+  x <- analysis(split)
+
+  set.seed(inner_seed)
+  x_resampled <- bootstraps(x, times = inner_R)
+  
+  # variant on map that returns a numeric vector instead of a list
+  means_resampled <- map_dbl(x_resampled$splits, boot_inner_tidy)
+  
+  param_estimate <- tibble(
+    term = "mean",
+    estimate = mean(x$mpg),
+    std.error = sd(means_resampled)
+  )
+  
+  return(param_estimate)
+}
+
+```
+
+```{r Step 2 and 3 for studentized}
+# we should really use a bigger number than 100 for inner bootstrap
+# but inner_R = 1000 takes forever on my computer
+boot_Auto2_tidy <- boot_Auto2 |>
+  mutate(
+    results = map(splits, boot_outer_tidy, inner_seed = 100, inner_R = 100)
+  )
+
+int_t(boot_Auto2_tidy, results, alpha = 0.05)
+```

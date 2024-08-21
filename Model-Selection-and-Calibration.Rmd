@@ -1,0 +1,508 @@
+---
+title: "Automating Model Selection Example Code and Class Activities"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Note: Stepwise Selection
+A "greedy" algorithm that picks the "best" model out of:
+-current model
+-all models +1 predictor
+-all models -1 predictor
+
+Practical: 
+1. Do not use p-values to do selection  => massively inflated type I/II error rates.
+2. Anything we do in stepwise selection using training set, we must repeat on validation set (including the entire selection procedure!)
+
+Better options
+1. Define a df budget, assign df based on domain knowledge.
+2. Fit a bunch of models, select best one (selection in parallel)
+3. Use penalized regression to auto-select variables.
+
+## Model Selection Using `workflowsets`
+
+The `workflowsets` package allows us to create models and recipes and then search over the entire set of combinations of model and recipe to find the optimal model.
+
+```{r load tidymodels packages and data}
+library(Lahman)
+library(tidyverse)
+library(tidymodels)
+library(kknn) # k-nearest neighbors
+library(probably)
+
+# Regression Example Data
+salaries <- Salaries %>%
+  dplyr::select(playerID, yearID, teamID, salary)
+peopleInfo <- People %>%
+  dplyr::select(playerID, birthYear, birthMonth, nameLast,
+         nameFirst, bats)
+batting <- battingStats() %>% 
+  left_join(salaries, 
+            by =c("playerID", "yearID", "teamID")) %>%
+  left_join(peopleInfo, by = "playerID") %>%
+  mutate(age = yearID - birthYear - 
+           1L *(birthMonth >= 10)) %>%
+  arrange(playerID, yearID, stint)
+
+batting_2016 <- batting %>% filter(yearID == 2016,
+                                   !is.na(salary),
+                                   G >= 100, AB >= 200
+                                   ) %>%
+  mutate(salary = log10(salary)) # log-transformed salary
+
+set.seed(11249)
+batting_2016_split <- initial_split(batting_2016, prop = 0.75)
+batting_train <- training(batting_2016_split)
+batting_test <- testing(batting_2016_split)
+
+# Classification Example Data
+Restrain <- readr::read_csv("Restrain.csv")
+fv <- Restrain |>
+  filter(SubCategory %in% c("Fruits", "Vegetables"))
+fv$SubCategory <- factor(fv$SubCategory, levels = c("Fruits","Vegetables"))
+
+set.seed(1880)
+fv_split <- initial_split(fv, prop = 0.80) 
+
+fv_train_tidy <- training(fv_split)
+fv_valid_tidy <- testing(fv_split)
+```
+
+Here we perform model selection for a regression problem.
+
+### Step 1: Define your models
+
+```{r define model types}
+linreg_model <- linear_reg(mode = "regression", engine = "lm")
+knn_model <- nearest_neighbor(mode = "regression",
+                              engine = "kknn",
+                              neighbors = 8, dist_power = 2)
+```
+
+### Step 2: Define your recipes
+
+```{r define recipes}
+linear_recipe <- recipe(
+  salary ~ HR + BB + age, # response ~ predictors
+  data = batting_train
+)
+
+quadratic_recipe <- recipe(
+  salary ~ HR + BB + age, # response ~ predictors
+  data = batting_train
+) |>
+  step_poly(age, degree = 2)
+
+interaction_recipe <- recipe(
+  salary ~ HR + BB + age, # response ~ predictors
+  data = batting_train
+) |>
+  step_interact(terms = ~HR:BB) # add HR:BB interaction term
+
+knn_recipe <- recipe(
+  salary ~ HR + BB + age,
+  data = batting_train
+) |>
+  step_normalize(all_numeric_predictors())
+```
+
+Notice here that instead of explicitly adding an $age^2$ term or an interaction term in the formula, we define the variables of interest in the formula and then use `step_poly` and `step_interact` to create the quadratic/interaction terms.
+
+### Step 3: Create the workflow_set
+
+```{r create workflow set}
+all_models <- workflow_set(
+  preproc = list(linear = linear_recipe, quadratic = quadratic_recipe,
+                 interaction = interaction_recipe, knn = knn_recipe),
+  models = list(lr = linreg_model, lr = linreg_model,
+                lr = linreg_model, knn = knn_model),
+  cross = FALSE # don't mix knn recipes with linear models or vice-versa
+)
+all_models
+```
+
+Notice that the `result` column is empty. We're now going to fill that column:
+
+### Step 4: Do the Cross-Validation Split
+
+```{r tidycv}
+# 10-fold cv, not repeated
+set.seed(1112)
+batting_cv <- vfold_cv(batting_train, v = 10)
+```
+
+### Step 5: Fit the workflow set on all folds
+
+```{r fit resamples}
+all_models <- all_models |>
+  workflow_map("fit_resamples",
+               resamples = batting_cv,
+               metrics = metric_set(rmse, mae),
+               verbose = TRUE) # lets you know where you are in the fitting process (cheking time)
+all_models
+```
+
+If we wanted to tune parameters (for example, tuning k in k-nearest neighbors), our first argument would be "tune_grid" instead of "fit_resamples", and we would need to pass the grid we want to tune over:
+
+```{r tuning k}
+knn_model2 <- nearest_neighbor(mode = "regression", 
+                               engine = "kknn",
+                               neighbors = tune(), 
+                               dist_power = 2)
+
+knn.grid <- expand.grid(neighbors = seq(2,16, by = 2)) #Just random arbitrary number selected # doing 8 times
+
+all_models2 <- workflow_set(
+  preproc = list(linear = linear_recipe, 
+                 quadratic = quadratic_recipe,
+                 interaction = interaction_recipe, 
+                 knn = knn_recipe),
+  models = list(lr = linreg_model, 
+                lr = linreg_model,
+                lr = linreg_model,
+                knn2 = knn_model2),
+  cross = FALSE 
+)
+
+all_models2 <- all_models2 |>
+  # add the grid for JUST the knn model
+  option_add(grid = knn.grid, id = "knn_knn2") |>
+  workflow_map("tune_grid",
+               resamples = batting_cv,
+               metrics = metric_set(rmse), # can add more
+               verbose = TRUE)
+
+all_models2
+```
+
+### Step 6: Select the Best Model
+
+```{r plot stuff with autoplot}
+autoplot(all_models2) #gives standerror bounds
+```
+
+Note that this plot is a little weird because it doesn't say which recipe-model combination (or which value of $k$ in k-nn) corresponds to which RMSE estimate. We can focus on the k-nn tuning:
+
+```{r plot only knn with autoplot}
+autoplot(all_models2, id = "knn_knn2")
+```
+
+Hey, we've seen this plot before! We know how to interpret it!
+
+It's usually easiest to output this stuff in a table:
+
+```{r rank results}
+rank_results(all_models2) |>
+  dplyr::select(wflow_id, .config, .metric, mean, std_err, rank) |>
+  arrange(.metric, rank)
+```
+
+It looks like the quadratic regression model is doing the best by RMSE, so let's pick it:
+
+```{r get out best model}
+my_best_model <- all_models2 |>
+  extract_workflow("quadratic_lr")
+# then fit this model and make predictions as usual
+```
+
+If we want to get out the best k-nn model, it takes a bit more work:
+
+```{r get out best knn}
+best_k <- all_models2 |> 
+  extract_workflow_set_result(id = "knn_knn2") |> 
+  select_best(metric = "rmse")
+  
+my_best_knn <- all_models2 |>
+  extract_workflow("knn_knn2") |>
+  finalize_workflow(parameters = best_k)
+
+my_best_knn
+```
+
+## Model Calibration with `probably`
+
+Before we actually select a model, it is a good idea to make sure that those predictions are well-calibrated and sensible.
+
+```{r best lm fit}
+best_lm_refit <- my_best_model |>
+  fit_resamples(
+    resamples = batting_cv,
+    # save the cross-validated predictions
+    control = control_resamples(save_pred = TRUE)
+)
+
+predictions_best_model <- best_lm_refit |>
+  collect_predictions()
+```
+
+A good way to do this is to plot $y$ vs. $\hat{y}$:
+
+```{r check plausibility of predictions}
+ggplot(predictions_best_model,
+       mapping = aes(
+         x = .pred,
+         y = salary
+       )) +
+  geom_point()
+```
+
+The `probably` package makes this visualization a bit easier:
+
+```{r y vs y-hat with probably}
+cal_plot_regression(
+  predictions_best_model,
+  truth = salary,
+  estimate = .pred
+)
+```
+#good calibration must be similar to 5:5 line
+Note that this plot is $\hat{y}$ vs $y$, but it doesn't really matter. We're really looking for two things:
+
+1. Are there nonsensical predicted values? Not really
+2. Are the predictions well calibrated? No
+
+Since we log-transformed the salaries, we're not *too* worried about nonsense predictions, but we definitely would be if we used just the untransformed salaries!
+
+```{r best knn fit}
+best_knn_refit <- my_best_knn |>
+  fit_resamples(
+    resamples = batting_cv,
+    # save the cross-validated predictions
+    control = control_resamples(save_pred = TRUE)
+)
+
+predictions_best_knn <- best_knn_refit |>
+  collect_predictions()
+
+cal_plot_regression(
+  predictions_best_knn,
+  truth = salary,
+  estimate = .pred
+)
+```
+
+Both models are poorly calibrated, but the k-nn looks a bit better to me.
+
+At this point we have two options:
+
+1. Go back into our bag of models and decide on a more appropriate model or recipe, given what we know now
+2. Recalibrate the model by post-processing the predictions
+
+Let's see how option 2 works. First we check to see if the post-processing produces any meaningful improvement in cross-validated predictions:
+
+```{r post-process quadreg predictions}
+best_knn_refit |>
+  cal_validate_linear(
+    save_pred = TRUE,
+    smooth = TRUE) |> # nonlinear smoothing, use smooth = FALSE for linear transformation
+  collect_predictions() |>
+  cal_plot_regression(
+    truth = salary,
+    estimate = .pred
+  )
+```
+
+It doesn't (so we should really go back to Option 1 - find a new model), but let's pretend that it did.
+
+```{r}
+calibrate_knn <- predictions_best_knn |>
+  # instructions for post-processing
+  cal_estimate_linear(
+    truth = salary,
+    smooth = TRUE # nonlinear smoothing
+  )
+```
+
+Now we can fit and predict with our k-nn model:
+
+```{r fit and predict with calibration}
+knn_fit <- my_best_knn |> fit(
+  data = batting_train
+)
+
+knn_test_pred2 <- knn_fit |>
+  augment(new_data = batting_test) |>
+  # apply the post-processing
+  cal_apply(calibrate_knn)
+
+knn_test_pred2 |>
+  dplyr::select(
+    nameLast,
+    nameFirst,
+    salary,
+    .pred,
+    everything()
+  )
+```
+
+## Model Selection for Classification
+
+Let's just compare a logistic regression and a tuned k-nn model on the fruits-vegetables data.
+
+### Step 1: Define your models
+
+```{r define model types class}
+logreg_class <- logistic_reg(mode = "classification", engine = "glm")
+knn_class <- nearest_neighbor(mode = "classification",
+                              engine = "kknn",
+                              neighbors = tune(), dist_power = 2)
+```
+
+### Step 2: Define your recipes
+
+```{r define recipes class}
+logr_recipe <- recipe(
+  SubCategory ~ Taste + Cravings + Healthiness, # response ~ predictors
+  data = fv_train_tidy
+)
+
+knn_class_recipe <- recipe(
+  SubCategory ~ Taste + Cravings + Healthiness, # response ~ predictors
+  data = fv_train_tidy
+) |>
+  step_normalize(all_numeric_predictors()) # center and scale numeric predictors
+```
+
+### Step 3: Create the workflow_set
+
+```{r create workflow set class}
+all_models_class <- workflow_set(
+  preproc = list(logr = logr_recipe, knn = knn_class_recipe),
+  models = list(logr = logreg_class, knn = knn_class),
+  cross = FALSE # don't mix knn recipe with logistic model or vice-versa
+)
+```
+
+### Step 4: Do the Cross-Validation Split
+
+```{r tidycv class}
+# 10-fold cv, not repeated
+set.seed(1257)
+fv_cv <- vfold_cv(fv_train_tidy, v = 10)
+```
+
+### Step 5: Fit the workflow set on all folds
+
+```{r tune k class}
+knn.class.grid <- expand.grid(neighbors = seq(1,10))
+
+all_models_class <- all_models_class |>
+  # add the grid for JUST the knn model
+  option_add(grid = knn.class.grid, id = "knn_knn") |>
+  workflow_map("tune_grid",
+               resamples = fv_cv,
+               metrics = metric_set(brier_class, mn_log_loss), # can add more
+               verbose = TRUE)
+
+```
+
+### Step 6: Select the Best Model
+
+```{r plot stuff with autoplot class}
+autoplot(all_models_class)
+```
+
+
+```{r rank results}
+rank_results(all_models_class) |>
+  dplyr::select(wflow_id, .config, .metric, mean, std_err, rank) |>
+  arrange(.metric, rank)
+```
+
+Here the logistic regression model is doing best by Brier score, but the 10-nearest neighbors model performs slightly better by mean log-loss. Note that `rank` is computed based on the *first* metric you list, and not on each metric individually.
+
+Let's select the 10-nearest neighbors model:
+
+```{r get out best knn class}
+best_k_class <- all_models_class |> 
+  extract_workflow_set_result(id = "knn_knn") |> 
+  select_best(metric = "mn_log_loss")
+  
+my_best_knn_class <- all_models_class |>
+  extract_workflow("knn_knn") |>
+  finalize_workflow(parameters = best_k_class)
+
+my_best_knn_class
+
+```
+
+## Model Calibration for Classification
+
+Here we want to check that our *predictions* are well-calibrated. For a binary classification model, we can split our training set observations into several equally-sized bins based on the cross-validated probability of Positive and look at the actual proportion of positive within each bin:
+
+```{r actual vs predicted positive with probably}
+best_class_refit <- my_best_knn_class |>
+  fit_resamples(
+    resamples = fv_cv,
+    # save the cross-validated predictions
+    control = control_resamples(save_pred = TRUE)
+)
+
+predictions_best_class <- best_class_refit |>
+  collect_predictions()
+
+head(predictions_best_class)
+
+cal_plot_windowed(
+  predictions_best_class,
+  truth = SubCategory,
+  estimate = .pred_Vegetables, # give it a probability column
+  event_level = "second" # and tell it which row/column of the confusion matrix it corresponds to
+)
+```
+
+Assuming that we actually are using a classification model, we shouldn't have to worry about nonsense predictions, but we *very much* have to worry about poorly calibrated predictions. Here we're doing pretty well at high predicted probability of being vegetable but terrible at low predicted probabilities.
+
+For small datasets, it appears that beta-calibration (which assumes a beta distribution for the probabilities) is recommended:
+
+```{r post-process knn predictions class}
+library(betacal)
+best_class_refit |>
+  # cal_validate_beta is in probably but calls a function in betacal
+  cal_validate_beta(
+    metrics = metric_set(brier_class, mn_log_loss),
+    save_pred = TRUE) |> # nonlinear smoothing, use smooth = FALSE for linear transformation
+  collect_predictions() |>
+  cal_plot_windowed(
+    truth = SubCategory,
+    estimate = .pred_Vegetables, # give it a probability column
+    event_level = "second" # and tell it which row/column of the confusion matrix it corresponds to
+  )
+```
+
+Didn't really do much - probably the weird non-monotonicity is messing with the calibration.
+
+```{r post-process instructions class}
+calibrate_knn_class <- predictions_best_class |>
+  # instructions for post-processing
+  cal_estimate_beta(
+    truth = SubCategory
+  )
+```
+
+Now we can fit and predict with our k-nn model:
+
+```{r fit and predict with calibration class}
+knn_fit_class <- my_best_knn_class |> fit(
+  data = fv_train_tidy
+)
+
+knn_test_class <- knn_fit_class |>
+  augment(new_data = fv_valid_tidy) |>
+  # apply the post-processing
+  cal_apply(calibrate_knn_class)
+
+knn_test_class |>
+  dplyr::select(
+    Food,
+    SubCategory,
+    .pred_class,
+    .pred_Fruits,
+    .pred_Vegetables,
+    everything()
+  ) |>
+  arrange(.pred_Vegetables)
+```

@@ -1,0 +1,276 @@
+---
+title: "Slow Learning Using Simple Linear Regression: Example Code and Class Activities"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## A Simple Example
+
+In this example, we're going to build a slow-learning linear regression algorithm.
+
+In practice, *any* simple model can be used as the "base" of a slow-learning algorithm: boosted trees use (of course) trees, while neural networks typically use multiple regression with nonlinear transformations.
+
+## Data
+
+We'll use the baseball_2016 data because it's much easier to explain slow learning with regression problems than classification problems.
+
+```{r create batting-2016 data, warning = FALSE, message = FALSE}
+library(Lahman)
+library(tidyverse)
+library(tidymodels)
+
+salaries <- Salaries %>%
+  dplyr::select(playerID, yearID, teamID, salary)
+peopleInfo <- People %>%
+  dplyr::select(playerID, birthYear, birthMonth, nameLast,
+         nameFirst, bats)
+batting <- battingStats() %>% 
+  left_join(salaries, 
+            by =c("playerID", "yearID", "teamID")) %>%
+  left_join(peopleInfo, by = "playerID") %>%
+  mutate(age = yearID - birthYear - 
+           1L *(birthMonth >= 10)) %>%
+  arrange(playerID, yearID, stint)
+
+batting_2016 <- batting %>% filter(yearID == 2016,
+                                   !is.na(salary),
+                                   G >= 100, AB >= 200
+                                   ) %>%
+  mutate(salary = log10(salary), # there's a reason for this, I promise
+         lgID = factor(lgID, levels = c("AL", "NL"))) # fix the defunct league issue
+
+set.seed(11249)
+batting_2016_split <- initial_split(batting_2016, prop = 0.75)
+batting_train <- training(batting_2016_split)
+batting_test <- testing(batting_2016_split)
+```
+
+Let's arbitrarily do 50 iterations. In practice, we'd want to tune the number of iterations - large enough that we're making good predictions on the training set, not so large that we're overfitting.
+
+```{r setup predictions df}
+niterations <- 50
+salary_predictions <- vector("list", length = niterations+1)
+names(salary_predictions) <- paste0("Step", seq(0, niterations))
+```
+
+## Step 1: Initialize the Model
+
+### Step 1a: Fit a Very Stupid Model
+
+The book suggests to use $\hat{f}^0(x) = 0$. We can create a much better "stupid" model: use $\hat{f}^0(x) = \bar{y}$.
+
+```{r Step 1a}
+fhat0 <- lm(salary ~ 1, data = batting_train) # intercept only model
+prediction_formula <- coef(fhat0)[1]
+```
+
+### Step 1b: Compute the Residuals
+
+```{r Step 1b}
+yhat0 <- predict(fhat0, batting_train)
+
+resid0 <- batting_train$salary - yhat0
+
+batting_new <- batting_train |>
+  mutate(current_pred = yhat0,
+         current_resid = resid0)
+
+salary_predictions[[1]] <- batting_new$current_pred
+```
+
+## Step 2: Fit the Best Model on the Residuals
+
+Here we'll work with simple linear regression models.
+
+### Step 2a: Find the Best Model
+
+```{r Step 2a setup}
+predictor_possibilities <- c("G", "R", "H", "X2B", "X3B", "HR", "RBI",
+                             "SB", "CS", "BB", "SO", "IBB", "HBP", "SH", 
+                             "SF", "GIDP","age", "lgID")
+```
+
+We fit a simple linear regression model on the *residuals*. We search over all predictors to see which model produces the lowest training RSS.
+
+If we were using multiple linear regression instead, we might use something like AIC or BIC, and for something more complicated than linear regression, we typically use cross-validation.
+
+```{r Step 2a fit}
+p <- length(predictor_possibilities)
+RSS <- numeric(p)
+
+for(j in 1:p){
+  
+  candidate_formula <- paste("current_resid ~", predictor_possibilities[j])
+  
+  candidate_lm <- lm(as.formula(candidate_formula), data = batting_new)
+  
+  candidate_residuals <- batting_new$current_resid - predict(candidate_lm, data = batting_new)
+  
+  RSS[j] <- sum(candidate_residuals^2)
+}
+
+best_predictor <- predictor_possibilities[which.min(RSS)]
+best_predictor
+```
+
+Interpret Which predictor has minimum RSS which is "age".
+
+### Step 2b: Obtain the New Predicted Residuals
+
+Now we re-fit the model using our best predictor.
+
+```{r Step 2b}
+final_formula <- paste("current_resid ~", best_predictor)
+
+fhat1 <- lm(as.formula(final_formula), data = batting_new)
+
+yhat1 <- predict(fhat1, batting_new)
+```
+getting residuals from previous model
+
+## Step 3: Update the Model
+
+We only add in a *fraction* of the predictions thus update only a *fraction* of the residuals. This fraction is controlled by the learning rate $\lambda$.
+
+Let's use $\lambda = 0.1$, that is, we are only adding in 10% of the prediction on every iteration. Again, in a real model we want to tune this parameter as well.
+
+```{r Step 3}
+lambda <- 0.1
+
+prediction_formula <- paste(prediction_formula, "+", lambda, "*(", 
+                            coef(fhat1)[1], "+", coef(fhat1)[2], "*",
+                            names(coef(fhat1))[2], ")")
+
+batting_new <- batting_new |>
+  mutate(current_pred = current_pred + lambda*yhat1,
+         current_resid = current_resid - lambda*yhat1)
+
+salary_predictions[[2]] <- batting_new$current_pred
+
+ggplot(batting_new, aes(x = current_pred, y = salary)) +
+  geom_point() +
+  labs(x = "Predicted Salary (Step 1)", y = "Actual Salary")
+rmse(batting_new, truth = salary, estimate = current_pred) # training rmse
+```
+
+Notice that the training RMSE here is *not* that good. That's by design - this is only the first iteration. On each iteration, we intend to decrease the training RMSE.
+
+## Step 4: Repeat
+
+Each time through the loop, we have to do Steps 2 and 3:
+
+```{r Step 4}
+
+for(stepno in 2:niterations){
+
+  # Reset RSS - probably not necessary
+  RSS <- numeric(p)
+
+  for(j in 1:p){
+  
+    candidate_formula <- paste("current_resid ~", predictor_possibilities[j])
+  
+    candidate_lm <- lm(as.formula(candidate_formula), data = batting_new)
+  
+    candidate_residuals <- batting_new$current_resid - predict(candidate_lm, data = batting_new)
+  
+    RSS[j] <- sum(candidate_residuals^2)
+  }
+
+  best_predictor <- predictor_possibilities[which.min(RSS)]
+  
+  final_formula <- paste("current_resid ~", best_predictor)
+
+  fhat <- lm(as.formula(final_formula), data = batting_new)
+  
+  prediction_formula <- paste(prediction_formula, "+", lambda, "*(", 
+                              coef(fhat)[1], "+", coef(fhat)[2], "*", 
+                              names(coef(fhat))[2], ")")
+
+  yhat <- predict(fhat, batting_new)
+  
+  batting_new <- batting_new |>
+  mutate(current_pred = current_pred + lambda*yhat,
+         current_resid = current_resid - lambda*yhat)
+  
+  curr_rmse <- rmse(batting_new, truth = salary, estimate = current_pred) |>
+    pull(.estimate)
+
+    print(paste0("Step No. ", stepno, ": Best Predictor = ", best_predictor,
+                 ", RMSE = ", round(curr_rmse, 3)))
+
+  
+salary_predictions[[(stepno + 1)]] <- batting_new$current_pred
+
+}
+
+```
+
+As you can see, the RMSE drops quickly and then reaches an asymptote. 
+
+Let's see how a few of our predictions panned out:
+
+```{r check predictions}
+iter_pred <- as.data.frame(salary_predictions)
+iter_pred <- iter_pred |>
+  mutate(salary = batting_new$salary,
+         name = paste(batting_new$nameFirst, batting_new$nameLast))
+
+
+# Albert Pujols
+plot(0:niterations, (iter_pred |> filter(name == "Albert Pujols"))[,1:(niterations+1)],
+     xlab = "Iteration Number", ylab = "Predicted Salary",
+     main = "Albert Pujols")
+abline(h = (iter_pred |> filter(name == "Albert Pujols"))$salary)
+
+# Jose Altuve
+plot(0:niterations, (iter_pred |> filter(name == "Jose Altuve"))[,1:(niterations+1)],
+     xlab = "Iteration Number", ylab = "Predicted Salary", ylim = c(6.35, 6.6),
+     main = "Jose Altuve")
+abline(h = (iter_pred |> filter(name == "Jose Altuve"))$salary)
+
+# Mike Trout
+plot(0:niterations, (iter_pred |> filter(name == "Mike Trout"))[,1:(niterations+1)],
+     xlab = "Iteration Number", ylab = "Predicted Value", ylim = c(6.2, 7.3),
+     main = "Mike Trout")
+abline(h = (iter_pred |> filter(name == "Mike Trout"))$salary)
+
+# Ichiro Suzuki
+plot(0:niterations, (iter_pred |> filter(name == "Ichiro Suzuki"))[,1:(niterations+1)],
+     xlab = "Iteration Number", ylab = "Predicted Salary", ylim = c(6.3, 7.4),
+     main = "Ichiro Suzuki")
+abline(h = (iter_pred |> filter(name == "Ichiro Suzuki"))$salary)
+
+```
+
+Notice that we see different patterns for each player. For Pujols, we approach the prediction and then keep going. For Altuve, we start actually going the wrong direction before coming back in the correct direction. For Trout and Ichiro, we sort-of level off at a completely wrong prediction.
+
+## Step 5: Make Predictions
+
+Remember that ridiculous formula we've been building? Now it's time to use it. The code here is a bit complicated because (1) we've got to deal with factor variables and (2) we have to turn this formula we've been building into something R can evaluate.
+
+```{r Step 5}
+print(prediction_formula)
+
+## Get all predictors - whether or not they are in the model
+full_model_formula <- paste("salary ~", paste(predictor_possibilities, collapse = "+")) |>
+  as.formula()
+## so that we can use the relevant model matrix to predict
+batting_mm <- model.matrix(full_model_formula, data = batting_test)[,-1] |>
+  as.data.frame()
+
+batting_predictions <- batting_test |>
+  mutate(
+  pred_salary = eval(str2expression(prediction_formula), envir = batting_mm)
+)
+
+ggplot(batting_predictions, aes(x = pred_salary, y = salary)) + 
+  geom_point() +
+  labs(x = "Predicted Salary (Step 50)", y = "Actual Salary")
+rmse(batting_predictions, truth = salary, estimate = pred_salary)
+```
+
+Because we stuck with simple linear regression as our base model, our ultimate model ends up being a multiple linear regression model (once we combine all the like terms). However, there's no reason we have to use simple linear regression as our base model. Boosted trees use simple decision trees as their base model, while neural networks use nonlinear transformations.

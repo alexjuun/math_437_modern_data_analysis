@@ -1,0 +1,288 @@
+---
+title: "Alternatives to MSE Example Code and Class Activities"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Why MSE?
+
+The **gold standard** for model evaluation for almost *every* model used for inferential purposes, and most models used for predictive purposes, is based on the likelihood function for the observed data.
+
+In linear regression, under the assumption of normally-distributed error terms with constant variance, the likelihood function becomes
+
+$$
+L(\beta|X, y) = \prod_{i=1}^n \frac{1}{\sigma \sqrt{2 \pi}}e^{-\frac{1}{2\sigma^2}\left(y_i - \beta_0 - \sum_{j=1}^J \beta_j x_{ij}\right)^2} 
+$$
+
+Maximizing this likelihood function is equivalent to maximizing the log-likelihood function:
+
+$$
+l(\beta|X, y) = - n log(\sigma \sqrt{2 \pi}) - \frac{1}{2 \sigma^2} \sum_{i=1}^n \left(y_i - \beta_0 - \sum_{j=1}^J \beta_j x_{ij}\right)^2
+$$
+
+This is maximized at $\hat{\beta}$:
+
+$$
+l(\hat{\beta}|X, y) = C - \frac{1}{2 \sigma^2} \sum_{i=1}^n \left(y_i - (\hat{\beta_0} + \sum_{j=1}^J \hat{\beta_j} x_{ij})\right)^2
+$$
+
+But $\hat{\beta_0} + \sum_{j=1}^J \hat{\beta_j} x_{ij} = \hat{y}_i$. So
+
+$$
+l(\hat{\beta}|X, y) = C - \frac{1}{2 \sigma^2} \sum_{i=1}^n \left(y_i - \hat{y}_i\right)^2 = C - \frac{n}{2 \sigma^2} MSE
+$$
+
+## Lahman Baseball Data
+
+```{r create batting-2016 data, warning = FALSE, message = FALSE}
+library(Lahman)
+library(tidyverse)
+library(tidymodels)
+library(olsrr) # more criteria
+
+salaries <- Salaries %>%
+  dplyr::select(playerID, yearID, teamID, salary)
+peopleInfo <- People %>%
+  dplyr::select(playerID, birthYear, birthMonth, nameLast,
+         nameFirst, bats)
+batting <- battingStats() %>% 
+  left_join(salaries, 
+            by =c("playerID", "yearID", "teamID")) %>%
+  left_join(peopleInfo, by = "playerID") %>%
+  mutate(age = yearID - birthYear - 
+           1L *(birthMonth >= 10)) %>%
+  arrange(playerID, yearID, stint)
+
+batting_2016 <- batting %>% filter(yearID == 2016,
+                                   !is.na(salary),
+                                   G >= 100, AB >= 200
+                                   ) %>%
+  mutate(salary = salary/1000) # salary in thousands
+
+set.seed(11249)
+batting_2016_split <- initial_split(batting_2016, prop = 0.75)
+batting_train <- training(batting_2016_split)
+batting_test <- testing(batting_2016_split)
+```
+
+Here we'll compare two models:
+
+```{r model-1}
+lm1 <- lm(salary ~ HR + BB + age, data = batting_train)
+summary(lm1)
+```
+
+```{r model-2}
+lm2 <- lm(salary ~ HR + BB + age + I(age^2), data = batting_train)
+summary(lm2)
+```
+
+## Penalized Likelihood-Based Metrics: AIC, BIC, Cp
+
+Our fitted $\hat{\beta}$'s maximize the log-likelihood on the *training* set. So more complicated models will have higher log-likelihoods on the training set, but then fall apart (variance is too high) on unseen data.
+
+Much research was done in the 1960's and 1970's to try to estimate the test RSS/MSE using *only* the training RSS/MSE. Since RSS and MSE are related to the log-likelihood function, a natural course of research was to determine how to transform the log-likelihood function to obtain appropriate estimates.
+
+The idea behind AIC, BIC, and Cp is to add a penalty term related to the number of predictors in the model to the (transformed) log-likelihood function. The stiffer the penalty, the more training RSS will have to decrease for the more complex model to be considered "better."
+
+### AIC
+
+The AIC for a linear regression model with $d \leq p$ numerical predictors is given by
+
+$$
+AIC = -2 l + 2 d + C
+$$
+
+where $l$ is the value of the log-likelihood function evaluated at $\hat{\beta}$ and $C$ is a constant irrelevant to optimization that (somewhat annoying) changes even between R functions that compute AIC. Note that we can consider AIC to have two non-irrelevant terms: the "deviance" (-2 times the log-likelihood) and the penalty term.
+
+When we add a predictor to the model, the penalty term increases by 2 - if the log-likelihood does not increase enough to offset the penalty term, then AIC will also increase. Thus, we can use AIC to compare between models with different numbers of predictors:
+
+```{r compare AIC}
+AIC(lm1, lm2)
+```
+
+1. Which model is better using AIC? Why?
+
+### BIC
+
+The BIC for a linear regression model with $d \leq p$ numerical predictors is given by
+
+$$
+BIC = -2 l + log(n) d + C
+$$
+
+where $l$ is the value of the log-likelihood function evaluated at $\hat{\beta}$, $n$ is the number of observations in the (training) dataset, and $C$ is a constant irrelevant to optimization.
+
+1. If the two criteria disagree on the "best" model, will AIC or BIC choose a simpler model? Why?
+
+We can use BIC to compare between models with different numbers of predictors:
+
+```{r compare BIC}
+BIC(lm1, lm2)
+```
+
+2. Which model is better using BIC? Why?
+
+Note that we can also use the `AIC` function to compute BIC:
+
+```{r compare BIC 2}
+n <- nrow(batting_train)
+AIC(lm1, lm2, k = log(n))
+```
+
+## Metrics for Estimating Test Error Rate
+
+Many other options for accuracy measures can be found in the `olsrr` package. These include AIC and BIC:
+
+```{r ols AIC BIC}
+# AIC
+ols_aic(lm1)
+ols_aic(lm2)
+# BIC = SBC
+ols_sbc(lm1)
+ols_sbc(lm2)
+```
+
+
+However, they also include:
+
+### Hocking's Sp
+
+Hocking's Sp = $$\frac{RSS}{(n-d-1)(n-d-2)}$$
+
+```{r ols hocking}
+ols_hsp(lm1)
+ols_hsp(lm2)
+```
+
+### Mallows' Cp
+
+The book gives two different forms of $Cp$:
+
+$$
+Cp = \frac{1}{n}(RSS + 2 d \hat{\sigma}_p^2)
+$$
+
+where $\hat{\sigma}_p^2$ is the estimated variance of the random error in the full model, and
+
+$$
+Cp = \frac{RSS}{\hat{\sigma}_p^2} + 2d - n
+$$
+
+which is the formula I found in Mallows (1973) for regression without an intercept (with an intercept add 1 to $d$, which is irrelevant to the minimization). Based on the help file, I'm assuming that the version computed by the olsrr package uses Mallows' original formula.
+
+Importantly, Mallows' Cp supposes that the true variance of the error term is estimated using the model with all $p$ predictors, e.g.:
+
+```{r ols mallows}
+full_model <- lm(salary ~ G +  R + H + X2B + X3B + HR + RBI + 
+                   SB + CS + BB + SO + IBB + HBP + SH + SF + GIDP + 
+                   age + I(age^2) + lgID,
+                 data = batting_train)
+ols_mallows_cp(lm1, fullmodel = full_model)
+ols_mallows_cp(lm2, fullmodel = full_model)
+```
+
+## Cross-Validated MSE
+
+The best estimate of test MSE is an actually estimated test MSE. We can estimate test MSE using cross-validation.
+
+In base R, the typical function to do this is `cv.glm` in the `boot` package. However, it is often easier to do your own k-fold cross-validation and customize to your liking.
+
+### Step 1: Set up your folds
+
+```{r set up k folds}
+set.seed(17)
+k <- 10
+reorder_rows <- sample(n)
+# Recall: n = nrow(batting_train)
+fold_numbers <- (reorder_rows %% k) + 1 # otherwise we get fold 0
+```
+
+### Step 2: Create a function for your accuracy metric
+
+```{r MSE function}
+model_MSE <- function(model, df, response){
+  # model: a model object
+  # df: a data frame on which we want to predict
+  # response: a character vector giving the name of the response variable
+  
+  predictions <- predict(model, newdata = df)
+  MSE <- mean((predictions - df[[response]])^2)
+  return(MSE)
+}
+```
+
+
+### Step 3: Create all the models of interest
+
+```{r create all models}
+models <- vector("list", length = 2)
+models[[1]] <- lm(salary ~ HR + BB + age, data = batting_train)
+models[[2]] <- lm(salary ~ HR + BB + age + I(age^2), data = batting_train)
+```
+
+### Step 4: Run the cross-validation
+
+```{r model fits}
+nmodels <- length(models)
+cv_error <- matrix(0, nrow = k, ncol = nmodels)
+# each row of cv_error represents a fold
+# each column of cv_error represents a model
+
+for (i in 1:k){
+  fold_validation_rows <- which(fold_numbers == i)
+  train_set <- batting_train[-fold_validation_rows,]
+  validation_set <- batting_train[fold_validation_rows,]
+  
+  for(j in 1:nmodels){
+    models[[j]] <- update(models[[j]], data = train_set)
+    cv_error[i, j] <- model_MSE(models[[j]], df = validation_set, response = "salary")
+  }
+}
+
+```
+
+### Step 5: Obtain estimates of MSE
+
+```{r estimate MSE}
+apply(cv_error, 2, mean)
+```
+
+Here model 1 has the lower cross-validated MSE. It is often more interpretable to work with RMSE, the square root of MSE:
+
+```{r estimate RMSE}
+cv_rmse <- sqrt(apply(cv_error, 2, mean))
+cv_rmse
+```
+
+1. How do we interpret these RMSE values?
+
+## ANOVA-Based Alternative: Adjusted R-Squared
+
+Suppose that the full model contains $p$ numerical predictors, of which we choose $d \leq p$ in the model we wish to test using ANOVA. The (simplest) ANOVA table for this test becomes:
+
+|Source|DF|Sum of Squares|Mean Square|F-Statistic|p-value|
+|:--------------|:--:|:------------------:|:----------:|:--:|:--:|
+|Model| d | SSM | MSM | F | p-value|
+|Error| n - d - 1| RSS | MSE | | |
+|Total| n - 1 | TSS | | | |
+
+We can compute $R^2$ as $\frac{SSM}{TSS} = 1 - \frac{RSS}{TSS}$ and interpret the ANOVA table as doing a test of significance based on $R^2$. The idea behind *Adjusted R-Squared* is to do the same computation using the mean squares column, i.e.,
+
+$$
+\text{Adjusted } R^2 = 1 - \frac{RSS/(n - d - 1)}{TSS/(n - 1)} = 1 - \frac{MSE}{Var(y)}
+$$
+
+Notice that the denominator is constant, but the numerator now depends on both the goodness-of-fit and the number of predictors. If adding a new predictor leads to too small an decrease in RSS, the MSE in the ANOVA table will increase and Adjusted R-Squared will decrease.
+
+To get the adjusted R^2 out directly, we can use:
+
+```{r adjusted r-squared}
+summary(lm1)$adj.r.squared
+summary(lm2)$adj.r.squared
+```
+
+1. Which model - the one with or without the $age^2$ term - is better using Adjusted $R^2$?

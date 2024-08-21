@@ -1,0 +1,241 @@
+---
+title: "K-Nearest Neighbors: Worked Example"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Note: Prediction goal: Given sample data, 'guess' the response value for an observation in the population that is not in the sample.
+In general: we wil know x-values but not y-values for observations. We want to make predictions for but: our sample data contains both x and y values. To evaluate how good our predictions are: create a 
+holdout set(Validation set) for which the y-values are known but assumed unknown!
+Test set: y-values are unknown (at time of model fitting) -> terminating varies!
+Regression: y is numerical
+Classification: y is categorical
+General Prediction Algorithm
+Step 0: Do EDA, data wrangling, domain knowledge acquisition, feature engineering, etc (It is not a prediction algorithm but it is vital before the process)
+Step 1: Define and objective function that measures "how wrong" the predictions are 
+Step 2: Fit the model on a training set (x known, y known). If parameter est. is required, choose values that minimize obj.function on training set. 
+Step 3: Model Assessment: evaluate the performance of the trained model on a validation set.
+Calculate the value of obj.function using the validation set.
+*Repeat for Step 2&3 different models(if multiple models)
+Step 4: Model selection: Choose the model that minimizes obj.function on the validation set.
+Step 5(Optional): Make predictions using a "real" test seet and the model chosen in Step 4. Sometimes this test set is actually a separate with validation set!!
+
+## The Data
+
+The [Restrain Food Database](https://restrain.shinyapps.io/restrainfooddatabase/) was "designed by Cardiff University scientists [to] help people lose weight and eat more healthily."
+
+The database contains 520 images of foods that should be familiar to people living in the UK. Each food is rated for healthiness, taste, and the strength of cravings for the food on a scale from 0-100.
+
+```{r import data, message = F, warning = F}
+library(tidyverse)
+Restrain <- readr::read_csv("Restrain.csv")
+Restrain |> group_by(SubCategory) |> count()
+```
+
+Here we have 10 categories. Let's create just four categories: savory, sweet, takeaway, and fruits/veggies:
+
+```{r collapse categories}
+library(forcats) # tidyverse for factors
+Restrain2 <- Restrain |> 
+  mutate(SubCategory = fct_collapse(SubCategory,
+    savory = c("Bakery (savoury)", "Savoury snacks"),
+    sweet = c("Bakery (sweet)", "Biscuits", "Confectionery", "Desserts"),
+    takeout = c("Takeaway (chain)", "Takeaway (generic)"),
+    fruit_veggie = c("Fruits", "Vegetables")
+  )
+)
+```
+
+## k-Nearest Neighbors Algorithm (base R)
+
+1. Explain how a k-nearest neighbors classification algorithm (KNN) works.
+Step 1: Pick some value K >=1 (k<=n)
+Step 2: For each obs. in the validation set/ test set, find the k "Closet" points in the training set.
+Step 3: Assign the class corresponding to the "most common" class among the K points.
+When k=1, every point in valid set is classified to cat. corresponding to the closest point in training set. (Low bias, high variance)
+When k=n, every point in valid set is classified to most common cat. in the training set ( n= obs in training set) (High bias, low variance)
+As K increases, bias increases and variance decreases
+
+
+
+### Splitting Training and Holdout Sets
+
+```{r}
+n <- nrow(Restrain2)
+set.seed(1003)
+# Selecting a random sample of 20% of rows to be in the holdout set
+test.rows <- sample(n, floor(0.20*n), replace = FALSE)
+Restrain_train <- Restrain2[-test.rows,] # -test.rows meaning that all rows except test.rows.
+Restrain_valid <- Restrain2[test.rows,]
+```
+
+This gives us 104 foods (20%) in the holdout set and the remaining 416 (80%) that can be used to fit the model.
+
+# Restrain_train %>% summarize(H_sd = sd(Healthiness), T_sd =sd(Taste), c_sd = sd(Cravings))
+
+### Pre-Processing the Predictors
+
+```{r pre-processing}
+train_predictors <- Restrain_train |>
+  dplyr::select(Taste, Cravings, Healthiness) |> 
+  scale()  #scale converts to z-score.
+valid_predictors <- Restrain_valid |>
+  dplyr::select(Taste, Cravings, Healthiness) |>
+  mutate(
+    Taste = (Taste - mean(Restrain_train$Taste))/sd(Restrain_train$Taste),
+    Cravings = (Cravings - mean(Restrain_train$Cravings))/sd(Restrain_train$Cravings),
+    Healthiness = (Healthiness - mean(Restrain_train$Healthiness))/sd(Restrain_train$Healthiness)
+  ) # trying to put (0,0) in both training and validation in same place.
+```
+
+1. What does the `scale` function do? Why do we need to do it?
+getting z-score , unitless
+2. Why do we have to normalize the validation set values based on the training set?
+giving sd distances depends on variations.
+### Running the Model
+
+The `knn` function in the `class` package runs k-nearest neighbors with a Euclidean distance. Ties are broken at random. The response variable has to be a factor, but luckily we've already converted our response to a factor variable.
+
+```{r knn-1, message = FALSE, warning = FALSE}
+library(class)
+
+train_response <- Restrain_train$SubCategory # already a factor
+
+k1 <- knn(train = train_predictors, test = valid_predictors, 
+          cl = train_response, k = 1)   #(train = train x test=validation x cl= train y)
+```
+
+1. What does each argument in the `knn` function indicate?
+
+```{r knn-10}
+k10 <- knn(train = train_predictors, test = valid_predictors, 
+           cl = train_response, k = 10, prob = TRUE)
+
+k10_predictions <- data.frame(
+  food = Restrain_train$Food,
+  predicted_class = k10,
+  predicted_prob = attr(k10, "prob")
+)
+
+head(k10_predictions)
+
+
+```
+
+2. How do we let R know that we want to estimate probabilities? How are those probabilities calculated?
+
+## k-Nearest Neighbors Algorithm (tidymodels)
+
+```{r initial split with tidymodels, message = F, warning = F}
+library(rsample)
+set.seed(1880)
+Restrain_split <- initial_split(Restrain2, prop = 0.80) 
+# can include a strata = "variable_name" argument to do stratified random training/test sampling
+str(Restrain_split)
+```
+
+1. What information is contained in  `Restrain_split$data`? What is contained in `Restrain_split$in_id`? 
+
+```{r get the split}
+Restrain_train2 <- training(Restrain_split)
+Restrain_valid2 <- testing(Restrain_split)
+```
+
+2. What does `training` do? What does `testing` do?
+#Note: minkowski distance(L_p norm)
+For two points x_1,x_2 represented as vectors in n-dimensional space: 
+Minkowski distribution = (summation m=1 to n |x_1m-x_2m|^λ)^1/λ
+dist-power = 2: (summation m=1 to n |x_1m-x_2m|^2)^1/2
+When n=2, it is Euclidean distance dist=(a^2+b^2)^1/2
+when n=1, it is manhattan distance/city-block distance a+b
+
+#Note: Mahalanobis Distance
+compute covariance matrix for my predictors
+Calculate Euclidean distance but after rotating/scaling values based on covariances
+
+### Specify the Model
+
+With tidymodels, we create a `workflow` that starts with just a description of the type of model we want to run:
+
+```{r workflow, message = F, warning = F}
+library(workflows) # for the workflow
+library(parsnip) # for the model objects
+library(kknn) # for the actual model fitting
+
+K <- 10
+knn_model <- nearest_neighbor(mode = "classification", neighbors = K, dist_power = 2)
+# dist_power = 2 uses Euclidean distance
+
+knn_wflow <- workflow() |>
+  add_model(knn_model)
+```
+
+## Pre-Processing the Predictors
+
+To pre-process the data, we create a `recipe` that says how the variables  in the training set should be transformed before running the model. We then add the recipe to the workflow:
+
+```{r recipe, message = F, warning = F}
+library(recipes)
+
+knn_recipe <- recipe(
+  SubCategory ~ Taste + Cravings + Healthiness, # response ~ predictors
+  data = Restrain_train2
+) |>
+  step_normalize(all_numeric_predictors()) # center and scale numeric predictors (standardized which convert to the z score of all numerical predictors)
+
+knn_wflow <- knn_wflow |>
+  add_recipe(knn_recipe)
+
+```
+
+## Running the Model
+
+Now we `fit` the model we specified in our workflow:
+
+```{r fit knn}
+knn_fit <- fit(knn_wflow, data = Restrain_train2)
+knn_fit
+```
+
+Notice that we are using the `train.kknn` function in the `kknn` package instead.
+
+## Making Predictions
+
+As usual, we use the `predict` function to make predictions (instead of the "fit and predict at the same time" approach of `knn`):
+
+```{r make predictions}
+knn_predictions <- predict(knn_fit, new_data = Restrain_valid2)
+```
+
+```{r make probabilistic predictions}
+knn_predictions_raw <- predict(knn_fit, new_data = Restrain_valid2, type = "prob")
+```
+
+1. What is the difference between the way these predictions are reported and the way they were reported with `knn`?
+
+2. We used 10-nearest neighbors! Why don't we get nice round percentages with these predictions?
+because it is weighted 
+We can also use `augment` to add the predictions to the original data frame:
+
+```{r augment}
+predictions_df <- broom::augment(knn_fit, new_data = Restrain_valid2, type = "prob")
+predictions_df |> dplyr::select(
+  Food,
+  SubCategory, 
+  .pred_class, 
+  .pred_savory, 
+  .pred_sweet, 
+  .pred_fruit_veggie, 
+  .pred_takeout) |>
+  slice(seq(12, 102, by = 10))
+```
+
+The accuracy of our predictions can be obtained using the `yardstick` package:
+
+```{r accuracy, message = F, warning = F}
+library(yardstick)
+accuracy(predictions_df, truth = SubCategory, estimate = .pred_class)
+```
